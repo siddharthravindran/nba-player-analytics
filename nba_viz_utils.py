@@ -96,7 +96,7 @@ BUCKET_CONFIG = {
     'param': 'touch_time_range_nullable',
     'prefix': 'TOUCH_', 
     # By starting with the code, .split(' ')[0] grabs 'LT2', '2_6', etc.
-    'buckets': ['LT2 < 2 Seconds', '2_6 2-6 Seconds', '6P 6+ Seconds']
+    'buckets': ["Touch < 2 Seconds", "Touch 2-6 Seconds", "Touch 6+ Seconds"]
 }
 }
 
@@ -320,21 +320,29 @@ def safe_cache_name(*parts):
     ).lower()
 
 
-def cached_fetch(cache_name, fetch_fn, force_refresh=False):
+def cached_fetch(cache_name, fetch_fn, force_refresh=False, retries=3, backoff=2.0):
     path = CACHE_DIR / f"{cache_name}.parquet"
-
     if path.exists() and not force_refresh:
         print(f"📂 Loading cache: {path.name}")
         return pd.read_parquet(path)
 
     print(f"🌐 Fetching fresh: {path.name}")
-    df = fetch_fn()
+    df = None
+    for attempt in range(retries):
+        try:
+            df = fetch_fn()
+            break
+        except Exception as e:
+            if attempt == retries - 1:
+                raise
+            print(f"   ↻ retry {attempt + 1}/{retries}: {e}")
+            time.sleep(backoff * (attempt + 1))
 
     if df is not None and not df.empty:
-        df.reset_index().to_parquet(path, index=False)
+        df.to_parquet(path, index=False)
         print(f"💾 Saved cache: {path.name}")
-
     return df
+    
 
 
 def should_refresh(season, season_type):
@@ -421,17 +429,31 @@ def apply_bucket_suffix(df, bucket, prefix, exclude_cols):
     return df.rename(columns=new_cols)
 
 
+
 def _consolidate(dfs, stat_type, source):
+    """Combine a list of fetched frames (one per season / season-type) into a
+    single player-season-indexed table. Light-touch: dedupes by
+    (player, season, team), so traded players keep a row per stint AND their
+    TOT row — it does NOT collapse them. (For one-row-per-player-season with
+    traded players merged to TOT, use consolidate_player_stats instead.)
+
+    Note: stat_type and source are passed in by fetch_nba_stats but unused here.
+    """
+    # Stack every season/season-type chunk into one frame.
     result = pd.concat(dfs, ignore_index=True)
 
+    # Some endpoints return PLAYER_LAST_TEAM_* instead of TEAM_* — normalize.
     if 'TEAM_ID' not in result.columns and 'PLAYER_LAST_TEAM_ID' in result.columns:
         result = result.rename(columns={'PLAYER_LAST_TEAM_ID': 'TEAM_ID'})
     if 'TEAM_ABBREVIATION' not in result.columns and 'PLAYER_LAST_TEAM_ABBREVIATION' in result.columns:
         result = result.rename(columns={'PLAYER_LAST_TEAM_ABBREVIATION': 'TEAM_ABBREVIATION'})
 
+    # One row per (player, season, team); traded players keep each stint + TOT.
     subset_cols = [c for c in ['PLAYER_ID', 'SEASON', 'TEAM_ID', 'TEAM_ABBREVIATION'] if c in result.columns]
     result = result.drop_duplicates(subset=subset_cols)
 
+    # Drop empty rows: by games-played if that column exists, else rows where
+    # every non-index column is NaN.
     game_cols = [c for c in ['GP', 'G'] if c in result.columns]
     if not game_cols:
         non_index = [c for c in result.columns if c not in INDEX_COLS]
@@ -439,37 +461,44 @@ def _consolidate(dfs, stat_type, source):
     else:
         result = result.dropna(subset=game_cols, how='all')
 
+    # Lock in the player-season index (only the index cols actually present).
     valid_index = [c for c in INDEX_COLS if c in result.columns]
     result.set_index(valid_index, inplace=True)
     return result
 
 
 def consolidate_player_stats(df):
-    # 1. Clean the index/columns immediately
+    """Canonicalize ONE frame's identity columns so it merges/indexes reliably,
+    then set the player-season index. Heavier than _consolidate: aggressively
+    cleans names/IDs/whitespace and collapses traded players to their TOT row.
+    Use on a single custom-fetched frame before joining it into the master.
+    """
+    # 1. Flatten any existing index and drop stray reset artifacts.
     df = df.reset_index()
     if 'index' in df.columns: df = df.drop(columns=['index'])
     if 'level_0' in df.columns: df = df.drop(columns=['level_0'])
 
-    # 2. Standardize Team Column Names
+    # 2. Normalize team column names (some endpoints use PLAYER_LAST_TEAM_*).
     df = df.rename(columns={
         'PLAYER_LAST_TEAM_ABBREVIATION': 'TEAM_ABBREVIATION',
         'PLAYER_LAST_TEAM_ID': 'TEAM_ID'
     })
-    
-    # 3. Aggressive Name & ID Cleaning
-    # We do this BEFORE setting the index to ensure every level is clean
+
+    # 3. Clean PLAYER_NAME before it becomes an index level: strip accents
+    #    (Jokić -> Jokic), trim, collapse repeated spaces. This is what lets the
+    #    same player match across endpoints/sources later.
     if 'PLAYER_NAME' in df.columns:
         df['PLAYER_NAME'] = df['PLAYER_NAME'].apply(
             lambda x: unidecode(str(x)).strip() if pd.notnull(x) else x
         )
-        # Remove double spaces
         df['PLAYER_NAME'] = df['PLAYER_NAME'].str.replace(r'\s+', ' ', regex=True)
 
-    # 4. THE NUCLEAR OPTION: Force every INDEX_COL to a stripped string
-    # This kills the "Regular Season " vs "Regular Season" bug forever
+    # 4. Force every index column to a clean stripped string so merges can't
+    #    fail on type/whitespace ("Regular Season " vs "Regular Season"). IDs go
+    #    float -> int -> str to kill "203999.0"-style floats; missing index
+    #    columns are filled "N/A" so the index is always complete.
     for col in INDEX_COLS:
         if col in df.columns:
-            # For IDs, we convert to float -> int -> str to handle '203999.0'
             if 'ID' in col:
                 df[col] = df[col].astype(float).fillna(0).astype(int).astype(str).str.strip()
             else:
@@ -477,18 +506,18 @@ def consolidate_player_stats(df):
         else:
             df[col] = "N/A"
 
-    # 5. Handle Traded Players (TOT Logic)
+    # 5. Traded players: if a TOT (season total) row exists, keep ONLY the TOT
+    #    row for those players and drop their per-team rows.
     if 'TEAM_ABBREVIATION' in df.columns:
         tot_mask = df['TEAM_ABBREVIATION'] == 'TOT'
         if tot_mask.any():
             traded_ids = df[tot_mask]['PLAYER_ID'].unique()
             df = pd.concat([df[tot_mask], df[~df['PLAYER_ID'].isin(traded_ids)]])
 
-    # 6. Final Deduplication and Index Lock
+    # 6. One row per player-season, then lock and sort the index.
     df = df.drop_duplicates(subset=INDEX_COLS)
-    
-    # Return a sorted, string-indexed dataframe
     return df.set_index(INDEX_COLS).sort_index()
+    
     
     
 def drop_redundant_cols(df, keep_pace_estimate=True):
@@ -600,7 +629,8 @@ def build_bucketed_features(
     fetch_fn,
     season_types=("Regular Season", "Playoffs"),
     exclude_cols=None,
-    sleep_time=5
+    sleep_time=5,
+    force_refresh=False
 ):
     if exclude_cols is None:
         exclude_cols = [
@@ -621,6 +651,7 @@ def build_bucketed_features(
                     stat_type=stat_type,
                     seasons=seasons,
                     season_type=season_type,
+                    force_refresh=force_refresh,
                     **{param_name: b}
                 )
             except Exception as e:
@@ -803,50 +834,43 @@ def fetch_nba_shot_locations(
     force_refresh: bool = False
 ) -> pd.DataFrame:
     from nba_api.stats.endpoints import leaguedashplayershotlocations
-    import pandas as pd
+    import ast
 
     dfs = []
-
     for season in seasons:
         print(f"Fetching Shot Locations for {season} ({season_type})...")
-
         try:
-            cache_name = safe_cache_name(
-                "shot_locations",
-                season,
-                season_type,
-                per_mode
-            )
-
+            cache_name = safe_cache_name("shot_locations", season, season_type, per_mode)
             refresh_this = force_refresh or should_refresh(season, season_type)
 
             def fetch_raw():
-                raw_data = leaguedashplayershotlocations.LeagueDashPlayerShotLocations(
-                    distance_range='By Zone',
-                    season=season,
-                    per_mode_detailed=per_mode,
-                    season_type_all_star=season_type,
+                raw = leaguedashplayershotlocations.LeagueDashPlayerShotLocations(
+                    distance_range='By Zone', season=season,
+                    per_mode_detailed=per_mode, season_type_all_star=season_type,
                     timeout=timeout
-                )
-                return raw_data.get_data_frames()[0]
+                ).get_data_frames()[0]
+                # Flatten BEFORE caching so the parquet never stores a MultiIndex
+                if isinstance(raw.columns, pd.MultiIndex):
+                    raw.columns = ["_".join(str(x) for x in col if str(x) != "")
+                                   for col in raw.columns]
+                return raw
 
-            df = cached_fetch(
-                cache_name,
-                fetch_raw,
-                force_refresh=refresh_this
-            )
+            df = cached_fetch(cache_name, fetch_raw, force_refresh=refresh_this)
 
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = [
-                    f"{col[0]}_{col[1]}".strip('_') if col[0] != '' else col[1]
-                    for col in df.columns.values
-                ]
+            # Belt-and-suspenders: old caches reload as tuple-strings — re-flatten them
+            def _flat(col):
+                s = str(col)
+                if s.startswith("(") and "," in s:
+                    try:
+                        return "_".join(str(x) for x in ast.literal_eval(s) if str(x) != "")
+                    except Exception:
+                        return s
+                return s
+            df.columns = [_flat(c) for c in df.columns]
 
             df['SEASON'] = season
             df['SEASON_TYPE'] = season_type
-
             dfs.append(df)
-
         except Exception as e:
             print(f"Error fetching {season}: {e}")
 
@@ -854,16 +878,13 @@ def fetch_nba_shot_locations(
         return pd.DataFrame()
 
     full_df = pd.concat(dfs, ignore_index=True)
-
     clean_cols = []
     for col in full_df.columns:
         c = str(col).replace(' ', '_').replace('-', '_').replace('(', '').replace(')', '')
         while '__' in c:
             c = c.replace('__', '_')
         clean_cols.append(c.strip('_'))
-
     full_df.columns = clean_cols
-
     return consolidate_player_stats(full_df)
     
     
@@ -916,6 +937,72 @@ def fetch_nba_hustle_stats(
 
     return _consolidate(chunks, "Hustle", source="hustle")
     
+    
+def fetch_nba_clutch_stats(
+    seasons,
+    season_type="Regular Season",
+    per_mode="PerGame",
+    measure_types=("Base", "Advanced"),
+    timeout=120,
+    force_refresh=False,
+):
+    """Clutch = last 5 min, margin <= 5 (the endpoint's defaults).
+    Pulls each measure type, prefixes everything CLUTCH_, joins into one frame.
+    Base + Advanced is the meaningful signal; clutch is small-sample, so skip
+    Misc/Scoring/Usage unless you really want the noise."""
+    from nba_api.stats.endpoints import leaguedashplayerclutch
+
+    keep_keys = set(INDEX_COLS) | {"PLAYER_ID", "PLAYER_NAME",
+                                   "TEAM_ABBREVIATION", "TEAM_ID",
+                                   "SEASON", "SEASON_TYPE"}
+    drop_meta = ["NICKNAME", "AGE", "GP", "G", "W", "L", "W_PCT", "MIN", "GROUP_SET", "TEAM_COUNT",
+    "DD2", "TD3", "index", "level_0"]
+
+    season_frames = []
+    for season in seasons:
+        measure_frames = []
+        for mt in measure_types:
+            print(f"🕐 Clutch [{mt}] — {season} ({season_type})")
+            cache_name = safe_cache_name("clutch", mt, season, season_type, per_mode)
+
+            def fetch_raw(mt=mt, season=season):
+                return leaguedashplayerclutch.LeagueDashPlayerClutch(
+                    measure_type_detailed_defense=mt,
+                    per_mode_detailed=per_mode,
+                    season=season,
+                    season_type_all_star=season_type,
+                    timeout=timeout,
+                ).get_data_frames()[0]
+
+            try:
+                df = cached_fetch(cache_name, fetch_raw,
+                                  force_refresh=force_refresh or should_refresh(season, season_type))
+            except Exception as e:
+                print(f"❌ Clutch [{mt}] {season} failed: {e}")
+                continue
+            if df is None or df.empty:
+                print(f"⚠️ No clutch data for {mt} {season}")
+                continue
+
+            df = _normalize_names(df)
+            df["SEASON"] = season
+            df["SEASON_TYPE"] = season_type
+            df = df.drop(columns=drop_meta, errors="ignore")
+            df = drop_redundant_cols(df)  
+            df = df.rename(columns={c: f"CLUTCH_{c}"
+                                    for c in df.columns if c not in keep_keys})
+            measure_frames.append(consolidate_player_stats(df))
+
+        if not measure_frames:
+            continue
+        season_df = measure_frames[0]
+        for extra in measure_frames[1:]:
+            new_cols = [c for c in extra.columns if c not in season_df.columns]
+            season_df = season_df.join(extra[new_cols], how="outer")
+        season_frames.append(season_df)
+
+    return pd.concat(season_frames).sort_index() if season_frames else pd.DataFrame()
+    
 
 def get_player_registry(season):
     print(f"🚀 Fetching {season}...")
@@ -929,6 +1016,40 @@ def get_player_registry(season):
         'DRAFT_NUMBER': 'DRAFT_POSITION'
     })
     return df
+    
+    
+
+REFRESH_CUSTOM_CONFIG = [
+    {
+        "name": "Shot Locations",
+        "fetch_fn": fetch_nba_shot_locations,
+        "suffix": "shoot",
+        "keep_cols": shoot_cols,
+    },
+    {
+        "name": "Defensive Dashboard",
+        "fetch_fn": fetch_nba_defensive_dashboard,
+        "suffix": "def",
+        "keep_cols": def_cols,
+    },
+    {
+        "name": "Defensive Breakdowns",
+        "fetch_fn": fetch_nba_defensive_breakdowns,
+        "suffix": None,
+        "keep_cols": None,
+    },
+    {
+    "name": "Hustle Stats",
+    "fetch_fn": fetch_nba_hustle_stats,
+    "suffix": "hustle",
+    "keep_cols": None,
+    },
+    {"name": "Clutch Stats",
+    "fetch_fn": fetch_nba_clutch_stats,
+    "suffix": "clutch",
+    "keep_cols": None
+    }
+]
 
 
 def get_multi_season_registry(seasons_list):
@@ -1148,7 +1269,7 @@ def sync_and_patch_stat(df_master, new_data_df, index_cols=None, add_new_cols=Tr
     if index_cols is None:
         index_cols = INDEX_COLS
 
-    incoming_stat_cols = set(new_data_df.columns)
+    incoming_stat_cols = set(new_data_df.columns) - {'TEAM_NAME', 'NICKNAME', 'AGE'}
 
     def normalize_df(df):
         df = df.reset_index()
@@ -1185,33 +1306,6 @@ def sync_and_patch_stat(df_master, new_data_df, index_cols=None, add_new_cols=Tr
     return master.sort_index()
     
     
-
-REFRESH_CUSTOM_CONFIG = [
-    {
-        "name": "Shot Locations",
-        "fetch_fn": fetch_nba_shot_locations,
-        "suffix": "shoot",
-        "keep_cols": shoot_cols,
-    },
-    {
-        "name": "Defensive Dashboard",
-        "fetch_fn": fetch_nba_defensive_dashboard,
-        "suffix": "def",
-        "keep_cols": def_cols,
-    },
-    {
-        "name": "Defensive Breakdowns",
-        "fetch_fn": fetch_nba_defensive_breakdowns,
-        "suffix": None,
-        "keep_cols": None,
-    },
-    {
-    "name": "Hustle Stats",
-    "fetch_fn": fetch_nba_hustle_stats,
-    "suffix": "hustle",
-    "keep_cols": None,
-    }   
-]
 
 
 def get_active_slice(df, season, season_type):
@@ -1365,6 +1459,7 @@ def refresh_and_patch_custom_stat(
     return sync_and_patch_stat(df_master, fresh_df)
     
     
+    
 def refresh_active_season_data(
     df_master,
     active_season="2025-26",
@@ -1372,6 +1467,7 @@ def refresh_active_season_data(
     full_stats=None,
     curated_config=None,
     custom_config=None,
+    bucket_config=None,
     force_refresh=True,
     per_mode="PerGame",
     timeout=180,
@@ -1379,6 +1475,7 @@ def refresh_active_season_data(
     full_stats = full_stats or FULL_NBA_STATS
     curated_config = curated_config or REFRESH_NBA_STATS_CONFIG
     custom_config = custom_config or REFRESH_CUSTOM_CONFIG
+    bucket_config = bucket_config or BUCKET_CONFIG
 
     before_cols = set(df_master.columns)
 
@@ -1426,6 +1523,24 @@ def refresh_active_season_data(
             timeout=timeout,
             per_mode=per_mode,
         )
+        
+    for stat_type, cfg in bucket_config.items():
+        print(f"\n🔄 Refreshing {stat_type} buckets — {active_season} {active_season_type}")
+        bucket_df = build_bucketed_features(
+            stat_type=stat_type, seasons=[active_season],
+            buckets=cfg["buckets"], prefix=cfg["prefix"], param_name=cfg["param"],
+            fetch_fn=fetch_nba_stats,
+            season_types=(active_season_type,),
+            force_refresh=force_refresh,
+        )
+        if bucket_df is None or bucket_df.empty:
+            print(f"⚠️ No bucket data for {stat_type}")
+            continue
+        # the shot dashboard carries its own MIN — don't let it overwrite the real box score
+        protect = [c for c in CORE_BOX_SCORE_COLS if c in bucket_df.columns]
+        protect += [c for c in ("index", "level_0") if c in bucket_df.columns]
+        bucket_df = bucket_df.drop(columns=protect, errors="ignore")
+        df_master = sync_and_patch_stat(df_master, bucket_df)
 
     new_cols = sorted(set(df_master.columns) - before_cols)
 
@@ -1484,6 +1599,54 @@ def compare_active_slice(before_df, after_df, cols=None, verbose=True):
         print(f"Dropped rows: {change_summary['dropped_rows']}")
 
     return aligned_before.loc[changed_rows], aligned_after.loc[changed_rows], change_summary
+    
+    
+    
+def backfill_master(existing_master, seasons,
+                    season_types=('Regular Season', 'Playoffs')):
+    """Sibling of refresh_active_season_data, for historical seasons.
+    Uses the ADD path (no force_refresh — historical data is final), then
+    stacks the new season rows beneath the existing master."""
+
+    # 1. Base + all FULL_NBA_STATS families → creates the historical ROWS
+    hist = build_master_df(seasons, FULL_NBA_STATS, season_types=season_types)
+    if hist.empty:
+        print("⚠️ No base data for these seasons.")
+        return existing_master
+
+    # 2. Curated nba_stats families (misc / rebounding / general / player-defense)
+    for stat_type, cfg in REFRESH_NBA_STATS_CONFIG.items():
+        hist = ingest_nba_stat(
+            hist, cfg.get('stat_type', stat_type), seasons,
+            suffix=cfg.get('suffix') or stat_type.lower(),
+            keep_cols=cfg.get('keep_cols'),
+            source_override=cfg.get('source_override'),
+            season_types=season_types,
+        )
+
+    # 3. Custom fetchers (shot locations, defense, breakdowns, hustle, clutch)
+    for cfg in REFRESH_CUSTOM_CONFIG:
+        hist = ingest_stat(
+            hist, cfg['fetch_fn'], seasons=seasons,
+            suffix=cfg.get('suffix'), keep_cols=cfg.get('keep_cols'),
+            season_types=season_types,
+        )
+        
+    # 3b. Bucketed shot-dashboard families (closest defender, dribbles, shot
+    #     clock, touch time) — built via build_bucketed_features, not the
+    #     configs, so the driver has to add them explicitly.
+    for stat_type, cfg in BUCKET_CONFIG.items():
+        bucket_df = build_bucketed_features(
+            stat_type=stat_type, seasons=seasons,
+            buckets=cfg['buckets'], prefix=cfg['prefix'],
+            param_name=cfg['param'], fetch_fn=fetch_nba_stats,
+            season_types=season_types,
+        )
+        hist = update_master_df(hist, bucket_df, suffix=stat_type.lower())
+
+    # 4. Stack historical rows beneath the existing master
+    combined = pd.concat([existing_master, hist]).sort_index()
+    return combined[~combined.index.duplicated(keep='last')]
 
 
 # =============================================================================
