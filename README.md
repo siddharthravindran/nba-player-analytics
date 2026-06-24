@@ -4,7 +4,7 @@ An end-to-end pipeline for NBA player data — assembling a wide, multi-source f
 official stats API, then modeling player salary to surface over- and under-paid players relative to the
 market.
 
-**Live app:** (https://siddharthravindran-nba-player-analytics-app-1rfmm9.streamlit.app/)
+**Live app:** https://siddharthravindran-nba-player-analytics-app-1rfmm9.streamlit.app/
 
 ## Overview
 
@@ -76,7 +76,7 @@ A few deliberate choices, since the why matters more than the code:
 
 - **R² = 0.845** on the out-of-time test (train ≤ 2021-22, test 2023-24+) — forecasting unseen seasons, not
   fitting in-sample.
-- **MAE ≈ $3.7M** on salaries that range to ~$60M.
+- **MAE ≈ $3.73M** on salaries that range to ~$60M.
 - The top features are the *obvious* ones — experience, minutes, scoring, draft pedigree, All-NBA credential.
   That's the evidence the model learned the real market: a salary model whose top drivers *weren't* the
   obvious ones would be broken. The novel findings live in the tail (interior defense, shot creation,
@@ -87,7 +87,8 @@ healthy minutes, All-NBA résumé, scoring — all pushing his price up. A singl
 season's minutes, because he played 36 games. The model correctly reads "elite player, injury-discounted
 season." The injury, isolated in one bar.
 
-<img width="2288" height="1592" alt="8EE7920E-113D-4DF1-8993-D3E01174000F" src="https://github.com/user-attachments/assets/9b55d813-b179-4de2-b619-566bee1771a6" />
+<img width="2288" height="1592" alt="8EE7920E-113D-4DF1-8993-D3E01174000F" src="https://github.com/user-attachments/assets/474e58ab-4a9b-46d2-b3ce-ea5be77d5ad1" />
+
 
 ## Limitations (by design, not bugs)
 
