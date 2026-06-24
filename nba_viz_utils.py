@@ -12,8 +12,11 @@ import time
 import unicodedata
 from unidecode import unidecode
 from pathlib import Path
-
 hv.extension("bokeh")
+import requests
+from io import StringIO
+from bs4 import BeautifulSoup, Comment
+from unidecode import unidecode
 
 from nba_api.stats.endpoints import (
     LeagueDashPlayerStats,
@@ -26,11 +29,10 @@ from nba_api.stats.endpoints import (
 )
 
 # =============================================================================
-# SECTION 1: CONSTANTS & CONFIG
+# SECTION 1: NBA.com CONSTANTS & CONFIG
 # =============================================================================
 
-PROJECT_DIR = Path("/content/drive/MyDrive/nba_data_vis")
-
+PROJECT_DIR = Path(__file__).resolve().parent if "__file__" in globals() else Path.cwd()
 CACHE_DIR = PROJECT_DIR / "cache"
 DATA_DIR  = PROJECT_DIR / "data"
 FIG_DIR   = PROJECT_DIR / "figures"
@@ -42,6 +44,13 @@ minimal_headers = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Referer": "https://www.nba.com/"
 }
+
+SALARY_CAP = {'2015-16':70_000_000,'2016-17':94_143_000,'2017-18':99_093_000,
+              '2018-19':101_869_000,'2019-20':109_140_000,'2020-21':109_140_000,
+              '2021-22':112_414_000,'2022-23':123_655_000,'2023-24':136_021_000,
+              '2024-25':140_588_000,'2025-26':154_647_000}
+
+SEASONS = tuple(SALARY_CAP.keys())   # one source of truth — add a cap year, the season list follows
 
 PT_STAT_TYPES = {
     'SpeedDistance', 'Rebounding', 'Possessions', 'CatchShoot', 'PullUpShot',
@@ -249,8 +258,32 @@ PLAY_TYPE_FGA_COLS = [
 ]
 
 
+# ── transpose: RS + PO side-by-side, one row per player-season ──────────────
+ID_KEYS     = ['PLAYER_ID', 'SEASON']
+DESCRIPTIVE = ['PLAYER_NAME', 'TEAM_ABBREVIATION', 'TEAM_ID', 'PLAYER_POSITION']
+
+
 # =============================================================================
-# SECTION 2: ROUTING
+# SECTION 2: BBREFERENCE CONSTANTS & CONFIG
+# =============================================================================
+
+
+HDR = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.basketball-reference.com/",
+}
+
+CACHE = CACHE_DIR / "bbref_salary_cache"
+for d in [CACHE]:
+    d.mkdir(parents=True, exist_ok=True)
+BASE = "https://www.basketball-reference.com"
+
+
+# =============================================================================
+# SECTION 3: ROUTING
 # =============================================================================
 
 def _route_stat_type(stat_type):
@@ -268,7 +301,7 @@ def _route_stat_type(stat_type):
 
 
 # =============================================================================
-# SECTION 3: API FETCH HELPERS
+# SECTION 4: API FETCH HELPERS
 # =============================================================================
 
 def _fetch_pt_shot(season, per_mode, season_type, timeout=120,**kwargs):
@@ -310,7 +343,7 @@ def _fetch_synergy(stat_type, season, player_or_team, per_mode, season_type, syn
 
 
 # =============================================================================
-# SECTION 4: CACHE & REFRESH HELPERS
+# SECTION 5: CACHE & REFRESH HELPERS
 # =============================================================================
 
 def safe_cache_name(*parts):
@@ -353,7 +386,7 @@ def should_refresh(season, season_type):
     
 
 # =============================================================================
-# SECTION 5: DATA PROCESSING HELPERS
+# SECTION 6: DATA PROCESSING HELPERS
 # =============================================================================
 
 def _normalize_names(df):
@@ -363,6 +396,12 @@ def _normalize_names(df):
                              .str.encode('ascii', errors='ignore')
                              .str.decode('utf-8'))
     return df
+    
+    
+def norm_name(x):
+    x = unidecode(str(x)).lower().strip().replace('.', '')   # P.J. -> pj
+    x = re.sub(r'\s+(jr|sr|iv|iii|ii|v)$', '', x)            # drop Jr/Sr/III suffixes
+    return re.sub(r'\s+', ' ', x).strip()
 
 
 
@@ -531,10 +570,26 @@ def drop_redundant_cols(df, keep_pace_estimate=True):
             or 'FANTASY' in c]
     return df.drop(columns=drop, errors='ignore')
     
+    
+def normalize_master(df):
+    df = df.reset_index()
+    df['PLAYER_NAME'] = df['PLAYER_NAME'].apply(lambda x: unidecode(str(x)).strip())
+    for col in INDEX_COLS:
+        if col not in df.columns:
+            continue
+        if col.endswith('ID'):
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('int64').astype(str)
+        else:
+            df[col] = df[col].astype(str).str.strip()
+    # when near-dups collapse, keep the MOST-populated row, not a random one
+    df = df.assign(_n=df.notna().sum(axis=1)).sort_values('_n', ascending=False)
+    df = df.drop_duplicates(subset=INDEX_COLS, keep='first').drop(columns='_n')
+    return df.set_index(INDEX_COLS).sort_index()
+    
 
 
 # =============================================================================
-# SECTION 6: MAIN FETCH FUNCTIONS
+# SECTION 7: MAIN FETCH FUNCTIONS
 # =============================================================================
 
 def fetch_nba_stats(
@@ -1004,11 +1059,19 @@ def fetch_nba_clutch_stats(
     return pd.concat(season_frames).sort_index() if season_frames else pd.DataFrame()
     
 
-def get_player_registry(season):
+def get_player_registry(season, retries=4, timeout=30):
+    import time
     print(f"🚀 Fetching {season}...")
-    df = LeagueDashPlayerBioStats(
-        season=season, headers=minimal_headers, timeout=60
-    ).get_data_frames()[0]
+    for attempt in range(1, retries + 1):
+        try:
+            df = LeagueDashPlayerBioStats(season=season, timeout=timeout).get_data_frames()[0]
+            break                                   # ↑ no headers= — nba_api sends the x-nba-stats tokens
+        except Exception as e:
+            if attempt == retries:
+                raise
+            wait = 2 ** attempt
+            print(f"   ⏳ {type(e).__name__} on {season}, retry {attempt}/{retries-1} in {wait}s")
+            time.sleep(wait)
     df['SEASON'] = season
     df = df.rename(columns={
         'PLAYER_HEIGHT_INCHES': 'HT_INCHES',
@@ -1016,6 +1079,23 @@ def get_player_registry(season):
         'DRAFT_NUMBER': 'DRAFT_POSITION'
     })
     return df
+
+
+def get_draft_table(seasons, cache_path="data/bio_registry.parquet"):
+    """Per-player draft info for merging on PLAYER_ID. Collapses across seasons —
+    bio has no SEASON_TYPE, so we never set_index(INDEX_COLS)."""
+    from pathlib import Path
+    cache = Path(cache_path)
+    if cache.exists():
+        reg = pd.read_parquet(cache)
+    else:
+        reg = pd.concat([get_player_registry(s) for s in seasons], ignore_index=True)
+        reg.to_parquet(cache)
+    bio = reg.groupby('PLAYER_ID')[['DRAFT_POSITION','DRAFT_YR']].first().reset_index()
+    bio['DRAFT_YR']       = pd.to_numeric(bio['DRAFT_YR'], errors='coerce')
+    bio['DRAFT_POSITION'] = pd.to_numeric(bio['DRAFT_POSITION'], errors='coerce')
+    bio['PLAYER_ID']      = bio['PLAYER_ID'].astype(str)
+    return bio
     
     
 
@@ -1052,25 +1132,8 @@ REFRESH_CUSTOM_CONFIG = [
 ]
 
 
-def get_multi_season_registry(seasons_list):
-    all_registries = []
-    for season in seasons_list:
-        try:
-            all_registries.append(get_player_registry(season))
-            print(f"✅ {season} Done.")
-            time.sleep(5)
-        except Exception as e:
-            print(f"❌ {season} Failed: {e}")
-
-    if not all_registries:
-        return pd.DataFrame()
-
-    master_df = pd.concat(all_registries, ignore_index=True)
-    return master_df.set_index(INDEX_COLS).sort_index()
-
-
 # =============================================================================
-# SECTION 7: MASTER DF MANAGEMENT
+# SECTION 8: MASTER DF MANAGEMENT
 # =============================================================================
 
 def build_master_df(seasons, stat_types, season_types=('Regular Season', 'Playoffs')):
@@ -1650,7 +1713,7 @@ def backfill_master(existing_master, seasons,
 
 
 # =============================================================================
-# SECTION 8: VISUALIZATION
+# SECTION 9: VISUALIZATION
 # =============================================================================
 
 def scatter_nba_stats(
@@ -2150,3 +2213,204 @@ def plot_shot_mix(
 
     if return_data:
         return mix_pct
+        
+        
+def plot_stat_over_time(df, players, stat, season_type="Regular Season", figsize=(11, 6)):
+    """Line chart of one stat across seasons for one or more players.
+
+    players: a name or list of names. stat: any column in df.
+    Uses the TOT row for traded seasons so each player gets one point per year.
+    Names must match the cleaned master ('Nikola Jokic', not 'Jokić').
+    """
+    if isinstance(players, str):
+        players = [players]
+
+    data = df.reset_index()
+    data = data[data["SEASON_TYPE"] == season_type]
+
+    if stat not in data.columns:
+        print(f"⚠️ '{stat}' not found.")
+        return
+
+    fig, ax = plt.subplots(figsize=figsize)
+
+    for player in players:
+        pdf = data[data["PLAYER_NAME"] == player].copy()
+        if pdf.empty:
+            print(f"⚠️ No rows for {player} ({season_type}).")
+            continue
+
+        # one value per season: prefer the TOT (traded-season total) row
+        pdf["_is_tot"] = pdf["TEAM_ABBREVIATION"] == "TOT"
+        pdf = (pdf.sort_values(["SEASON", "_is_tot"], ascending=[True, False])
+                  .drop_duplicates("SEASON", keep="first"))
+        pdf = pdf.dropna(subset=[stat]).sort_values("SEASON")
+        if pdf.empty:
+            print(f"⚠️ {player} has no {stat} values.")
+            continue
+
+        ax.plot(pdf["SEASON"], pdf[stat], marker="o", label=player)
+
+    ax.set_title(f"{stat.replace('_', ' ')} over time — {season_type}",
+                 fontsize=14, fontweight="bold")
+    ax.set_xlabel("Season")
+    ax.set_ylabel(stat.replace("_", " "))
+    ax.grid(True, linestyle="--", alpha=0.4)
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
+
+
+# =============================================================================
+# SECTION 10: BBREF SALARY SCRAPING
+# =============================================================================
+
+# 1) every player URL from the season totals pages (retired guys included)
+def harvest_player_urls(end_years=range(2016, 2027), sleep=3.5):
+    urls = set()
+    for yr in end_years:
+        r = requests.get(f"{BASE}/leagues/NBA_{yr}_totals.html", headers=HDR, timeout=30)
+        if r.status_code != 200:
+            print(f"  [{r.status_code}] {yr}"); time.sleep(sleep); continue
+        hits = re.findall(r'/players/[a-z]/[a-z0-9]+\.html', r.text)
+        urls.update(BASE + h for h in hits)
+        print(f"  {yr-1}-{str(yr)[2:]}: {len(set(hits))} players (total unique {len(urls)})")
+        time.sleep(sleep)
+    return sorted(urls)
+
+
+# 2) one player's salary history (name from the page <h1>)
+def bbref_salary_history(url):
+    slug = url.rstrip('/').split('/')[-1].replace('.html', '')
+    cf = CACHE / f"{slug}.csv"
+    if cf.exists(): return pd.read_csv(cf)
+    r = requests.get(url, headers=HDR, timeout=30)
+    if r.status_code != 200:
+        print(f"  [{r.status_code}] {slug}"); return None
+    soup = BeautifulSoup(r.content, "html.parser")
+    h1 = soup.find("h1"); player = h1.get_text(strip=True) if h1 else slug
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):   # salaries table is comment-hidden
+        if 'salaries' in c.lower() and '<table' in c.lower():
+            soup.append(BeautifulSoup(c, "html.parser"))
+    tbl = soup.find("table", id=re.compile("salar", re.I))
+    if tbl is None: return None
+    df = pd.read_html(StringIO(str(tbl)))[0]
+    df = df[[c for c in df.columns if str(c) in ('Season', 'Salary')]].copy()
+    df = df[df['Season'].astype(str).str.match(r'\d{4}-\d{2}$')]
+    df['Salary'] = df['Salary'].map(lambda s: int(re.sub(r'[^0-9]', '', str(s)) or 0))
+    df = df[df['Salary'] > 0]; df['Player'] = player
+    df.to_csv(cf, index=False)
+    return df
+
+
+def scrape_all(urls, sleep=3.5):
+    frames = []
+    for i, u in enumerate(urls, 1):
+        h = bbref_salary_history(u)
+        if h is not None and not h.empty: frames.append(h)
+        if i % 50 == 0: print(f"  {i}/{len(urls)}")
+        time.sleep(sleep)
+    out = pd.concat(frames, ignore_index=True).rename(columns={'Season': 'SEASON'})
+    out['name_key'] = out['Player'].apply(norm_name)
+    return out.drop_duplicates(['name_key', 'SEASON'])
+
+
+def fetch_all_nba_raw(url="https://www.basketball-reference.com/awards/all_league.html"):
+    r = requests.get(url, headers=HDR, timeout=30)
+    print("status:", r.status_code)
+    soup = BeautifulSoup(r.content, "html.parser")
+    for c in soup.find_all(string=lambda t: isinstance(t, Comment)):     # BBRef comment-hides tables
+        if 'all_league' in c.lower() and '<table' in c.lower():
+            soup.append(BeautifulSoup(c, "html.parser"))
+    tbl = soup.find("table", id=re.compile("all.?league", re.I)) or soup.find("table")
+    df = pd.read_html(StringIO(str(tbl)))[0]
+    print("shape:", df.shape, "| cols:", list(df.columns))
+    return df
+
+
+# =============================================================================
+# SECTION 11: MODELING LAYER
+# =============================================================================
+
+def build_model_table(df_master, id_keys=ID_KEYS, descriptive=DESCRIPTIVE):
+    df = df_master.reset_index()
+    rs = df[df['SEASON_TYPE'] == 'Regular Season'].copy()
+    po = df[df['SEASON_TYPE'] == 'Playoffs'].copy()
+
+    # one row per player-season; if dupes exist, keep the most-populated row
+    def _dedupe(d):
+        return (d.assign(_n=d.notna().sum(axis=1))
+                 .sort_values('_n', ascending=False)
+                 .drop_duplicates(id_keys)
+                 .drop(columns='_n'))
+    rs, po = _dedupe(rs), _dedupe(po)
+
+    # SEASON_TYPE is now redundant; descriptive cols come from RS only
+    rs = rs.drop(columns=['SEASON_TYPE'], errors='ignore')
+    po = po.drop(columns=['SEASON_TYPE'] + [c for c in descriptive if c in po.columns],
+                 errors='ignore')
+
+    # join on stable identity (PLAYER_ID + SEASON), NOT team —
+    # a traded player's RS team can differ from his playoff team
+    rs_i, po_i = rs.set_index(id_keys), po.set_index(id_keys)
+    model = rs_i.join(po_i, lsuffix='_rs', rsuffix='_po', how='left')
+    model['made_playoffs'] = model.index.isin(po_i.index).astype(int)
+    return model.reset_index()
+    
+    
+def attach_salaries(model, salaries, name_col='PLAYER_NAME'):
+    model = model.copy()
+    model['name_key'] = model[name_col].apply(norm_name)
+    out = model.merge(salaries[['name_key', 'SEASON', 'Salary']],
+                      on=['name_key', 'SEASON'], how='left')
+    return out.drop(columns='name_key')
+
+
+# =============================================================================
+# SECTION 12: FEATURE SELECTION
+# =============================================================================
+
+
+def prefilter_features(df, target='pct_cap', drop_cols=None, nan_thresh=0.85, corr_thresh=0.95):
+    import numpy as np
+    if drop_cols is None:
+        drop_cols = ['Salary','PLAYER_ID','PLAYER_NAME','name_key','SEASON',
+                     'TEAM_ABBREVIATION','TEAM_ID','SEASON_TYPE','Player', target]
+    X = df.drop(columns=[c for c in drop_cols if c in df.columns], errors='ignore')
+    X = X.select_dtypes(include=[np.number])
+    start = X.shape[1]
+
+    const = X.nunique(dropna=True).pipe(lambda s: s[s <= 1].index.tolist())     # 1) near-constant
+    empty = X.isna().mean().pipe(lambda s: s[s > nan_thresh].index.tolist())    # 2) near-empty (_po stays)
+
+    X2 = X.drop(columns=set(const) | set(empty))
+    corr  = X2.corr().abs()                                                     # 3) collinear pairs
+    upper = corr.where(np.triu(np.ones(corr.shape, dtype=bool), k=1))
+    collinear = [c for c in upper.columns if (upper[c] > corr_thresh).any()]
+
+    keep = [c for c in X2.columns if c not in collinear]
+    return keep, {'start': start, 'const': len(const), 'empty': len(empty),
+                  'collinear': len(collinear), 'keep': len(keep)}
+
+
+def explain_player(name, season, top_n=20):
+    row = mdf[(mdf['PLAYER_NAME'] == name) & (mdf['SEASON'] == season)]
+    if row.empty:
+        print(f"no row for {name} {season}"); return
+    i   = mdf.index.get_loc(row.index[0])
+    cap = SALARY_CAP[season]
+
+    contrib = pd.Series(sv[i], index=feats)
+    top = contrib.reindex(contrib.abs().sort_values(ascending=False).index).head(top_n)
+
+    base = expl.expected_value
+    pred = row['pred_pct_cap'].iloc[0]; actual = row['pct_cap'].iloc[0]
+    print(f"\n{name} — {season}")
+    print(f"  market baseline:  {base:6.1%}  (${base*cap:,.0f})")
+    print(f"  model prediction: {pred:6.1%}  (${pred*cap:,.0f})")
+    print(f"  actual salary:    {actual:6.1%}  (${actual*cap:,.0f})")
+    print(f"  → {'OVER' if actual>pred else 'UNDER'}paid vs market by ${abs(actual-pred)*cap:,.0f}\n")
+    print("  what pushed the market price (+ up / − down):")
+    for f, v in top.items():
+        print(f"    {'+' if v>0 else '−'} {f:32s} {v*cap:>+12,.0f}")
+
