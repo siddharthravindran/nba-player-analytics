@@ -69,6 +69,9 @@ def nice_feature(f):
 def money(x):
     return f"{'−' if x < 0 else ''}${abs(x)/1e6:,.1f}M"
 
+def color_name(c):
+    return "teal" if c == TEAL else "amber"
+
 def cap_dollars(pct, season):
     return pct * SALARY_CAP.get(season, CAP_2526)
 
@@ -111,9 +114,43 @@ if view == "Player":
                 f'<b style="color:{color}">${mkt_usd/1e6:,.1f}M</b> '
                 f'<span style="color:{MUTE}">({pred:.1%})</span></div>',
                 unsafe_allow_html=True)
-    st.caption(f"{season} salary cap: ${season_cap/1e6:,.0f}M  ·  "
-               f"prediction error vs. actual: {money(row['pred_pct_cap']*season_cap - row['pct_cap']*season_cap)}")
+    _err = row['pred_pct_cap']*season_cap - row['pct_cap']*season_cap
+    st.caption(f"{season} salary cap: \\${season_cap/1e6:,.0f}M  ·  "
+               f"prediction error vs. actual: {money(_err).replace('$', chr(92)+'$')}")
     st.write("")
+
+    # ---- price-summary anchor: baseline → market value (predicted) → actual salary ----
+    # makes "overpaid" legible even when every force-bar is teal: the bars build the market
+    # price up FROM the baseline, and the actual-salary marker sits above/below that price.
+    base_usd = float(meta["baseline_pct"].iloc[0]) * season_cap
+    summary = go.Figure()
+    # market value bar (what the profile is worth), colored by verdict
+    summary.add_trace(go.Bar(
+        x=[mkt_usd], y=["price"], orientation="h", width=0.5,
+        marker_color=color, marker_line_width=0,
+        hovertemplate=f"Market value: {money(mkt_usd)}<extra></extra>", showlegend=False))
+    # baseline marker (where every player starts)
+    summary.add_vline(x=base_usd, line_width=1.5, line_dash="dot", line_color=MUTE,
+                      annotation_text=f"league baseline {money(base_usd)}",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color=MUTE))
+    # actual-salary marker — the line the bar must clear to be "fairly paid"
+    summary.add_vline(x=paid_usd, line_width=2.5, line_color=INK,
+                      annotation_text=f"actually paid {money(paid_usd)}",
+                      annotation_position="bottom right",
+                      annotation_font=dict(size=11, color=INK))
+    summary.update_layout(
+        height=120, margin=dict(l=8, r=16, t=26, b=10),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color=INK, family="Archivo"),
+        xaxis=dict(tickprefix="$", tickformat=".2s", gridcolor=HAIR, zeroline=False,
+                   color=MUTE, range=[0, max(mkt_usd, paid_usd) * 1.18]),
+        yaxis=dict(visible=False), showlegend=False, bargap=0.4)
+    st.plotly_chart(summary, use_container_width=True, config={"displayModeBar": False})
+    _verb = "falls short of" if under else "overshoots"
+    st.caption(f"The {color_name(color)} bar is the market price the model builds for {player.split()[0].title()} "
+               f"(starting from the league baseline). The black line is the salary actually paid — "
+               f"when the bar {'doesn’t reach' if under else 'falls below'} the line, the player is {word.lower()}.")
 
     psh = shap[(shap["PLAYER_NAME"] == player) & (shap["SEASON"] == season)]
     psh = psh.reindex(psh["shap_usd"].abs().sort_values(ascending=False).index).head(15).iloc[::-1]
@@ -126,14 +163,14 @@ if view == "Player":
     fig.add_vline(x=0, line_width=1.5, line_color=MUTE)
     fig.update_layout(
         title=dict(text="WHAT MOVES THIS PLAYER'S PRICE", font=dict(size=14, color=MUTE, family="Oswald"), x=0, xanchor="left"),
-        height=440, margin=dict(l=10, r=20, t=44, b=28),
+        height=460, margin=dict(l=8, r=16, t=44, b=28), autosize=True,
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=INK, size=12, family="Archivo"),
         xaxis=dict(title="Contribution to predicted salary", tickprefix="$", tickformat=".2s", gridcolor=HAIR, zeroline=False, color=MUTE),
         yaxis=dict(gridcolor="rgba(0,0,0,0)", color=INK), bargap=0.34)
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(f"From a league baseline of {meta['baseline_pct'].iloc[0]:.1%} of cap. "
-               f"Teal raises the market price, amber lowers it. Top 15 factors.")
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    st.caption(f"Each bar is one factor's dollar contribution, summing from the baseline up to the market price above. "
+               f"Teal raises the price, amber lowers it. Top 15 factors.")
 
     with st.expander("Show all factors"):
         allf = shap[(shap["PLAYER_NAME"] == player) & (shap["SEASON"] == season)].copy()
