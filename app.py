@@ -139,18 +139,12 @@ if view == "Player":
                       annotation_text=f"actually paid {money(paid_usd)}",
                       annotation_position="bottom right",
                       annotation_font=dict(size=11, color=INK))
-    # CBA standard individual max (~35% of cap) — the ceiling the model prices toward
-    cba_max_usd = 0.35 * season_cap
-    summary.add_vline(x=cba_max_usd, line_width=1.2, line_dash="dash", line_color=AMBER,
-                      annotation_text="CBA max ~35%",
-                      annotation_position="top right",
-                      annotation_font=dict(size=9, color=AMBER))
     summary.update_layout(
         height=120, margin=dict(l=8, r=16, t=26, b=10),
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
         font=dict(color=INK, family="Archivo"),
         xaxis=dict(tickprefix="$", tickformat=".2s", gridcolor=HAIR, zeroline=False,
-                   color=MUTE, range=[0, max(mkt_usd, paid_usd, 0.35*season_cap) * 1.18]),
+                   color=MUTE, range=[0, max(mkt_usd, paid_usd) * 1.18]),
         yaxis=dict(visible=False), showlegend=False, bargap=0.4)
     st.plotly_chart(summary, use_container_width=True, config={"displayModeBar": False})
     _verb = "falls short of" if under else "overshoots"
@@ -158,13 +152,13 @@ if view == "Player":
                f"(starting from the league baseline). The black line is the salary actually paid — "
                f"when the bar {'doesn’t reach' if under else 'falls below'} the line, the player is {word.lower()}.")
 
-    if actual > 0.355:  # paid above the standard CBA individual max
+    if actual > 0.355:  # paid above the highest CBA tier (35% of cap, 10+ yr vets)
         st.info(
-            f"**{player.split()[0].title()} is paid above the standard CBA max (~35% of cap).** "
-            "The model only ever sees salaries up to the league max in its training data, so it prices "
-            "toward that ceiling and never predicts above it. Players on super-max or veteran extensions "
-            "that exceed 35% will therefore read as 'overpaid' by rule — not because anything in their "
-            "profile pulls their value down, but because their pay sits in a range the model never observed.")
+            f"**{player.split()[0].title()} is paid above the standard CBA maximum (35% of cap).** "
+            "The individual max is tiered by experience — 25% (0–6 yrs), 30% (7–9 yrs), 35% (10+ yrs) — "
+            "and the model's training data tops out at the league max, so it never predicts above ~35%. "
+            "A contract above that (via super-max or veteran provisions) will read as 'overpaid' by rule, "
+            "not because anything in the profile lowers the player's value.")
 
     psh = shap[(shap["PLAYER_NAME"] == player) & (shap["SEASON"] == season)]
     psh = psh.reindex(psh["shap_usd"].abs().sort_values(ascending=False).index).head(15).iloc[::-1]
