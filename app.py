@@ -177,8 +177,9 @@ if view == "Player":
         xaxis=dict(title="Contribution to predicted salary", tickprefix="$", tickformat=".2s", gridcolor=HAIR, zeroline=False, color=MUTE),
         yaxis=dict(gridcolor="rgba(0,0,0,0)", color=INK), bargap=0.34)
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-    st.caption(f"Each bar is one factor's dollar contribution, summing from the baseline up to the market price above. "
-               f"Teal raises the price, amber lowers it. Top 15 factors.")
+    st.caption(f"Each bar is one factor's dollar contribution for {player.split()[0].title()} specifically, "
+               f"summing from the baseline toward the market price above. "
+               f"Teal raises the price, amber lowers it. This player's top 15 factors.")
 
     with st.expander("Show all factors"):
         allf = shap[(shap["PLAYER_NAME"] == player) & (shap["SEASON"] == season)].copy()
