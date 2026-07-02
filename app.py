@@ -12,6 +12,7 @@ Run:  python3 -m streamlit run app.py
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from feature_glossary import compose_definition
 
 st.set_page_config(page_title="Market Value · NBA", page_icon="●", layout="wide")
 
@@ -234,14 +235,10 @@ if view == "Player":
             "DRIBB_0_FG3A_FREQUENCY": "Catch-and-shoot 3-point attempt rate (zero dribbles).",
             "DEFGT15_FGM_GT_15": "Opponent makes a player defends from 15+ ft away.",
         }
+
         def define(f):
-            base = f.replace("_rs","").replace("_po","").replace("_lag1","").replace("_lag2","")
-            suffix = (" (this season, reg.)" if f.endswith("_rs") else
-                      " (playoffs)" if "_po" in f else "")
-            time = (" — from the prior season" if "_lag1" in f else
-                    " — from two seasons ago" if "_lag2" in f else "")
-            d = DEFS.get(base, "A tracked stat in the feature set.")
-            return d + time
+            return compose_definition(f, DEFS)
+
         all_feats = sorted(shap["feature"].unique())
         pick = st.selectbox("Look up a factor", all_feats, key="gloss")
         st.markdown(f"**{nice_feature(pick)}**  \n{define(pick)}")
