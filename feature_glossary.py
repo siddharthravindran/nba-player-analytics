@@ -158,6 +158,112 @@ BASE_STAT_DEFS = [
 ]
 
 # ---------------------------------------------------------------------------
+# 3b. EXACT-MATCH CORE STATS — checked against the time/season-stripped core.
+#     Covers the tail the compositional parser doesn't reach: defensive
+#     tracking, hustle, clutch, team ratings, speed, and plain box-score stats.
+#     Keys are the stripped core (no _rs/_po/_lag).
+# ---------------------------------------------------------------------------
+CORE_STAT_DEFS = {
+    # --- star credential / eligibility / draft ---
+    "ALLNBA_WT_EVER":    "Weighted career All-NBA selections (1st=3, 2nd=2, 3rd=1), prior seasons only — the star credential",
+    "ALLNBA_PRIOR_EVER": "Career All-NBA selections before this season — the star credential",
+    "ALLNBA_PRIOR3":     "All-NBA selections in the prior three seasons — a recent-star signal",
+    "ALLNBA_WT3":        "Weighted All-NBA selections over the prior three seasons (1st=3, 2nd=2, 3rd=1) — recent-star weight",
+    "MAX_PCT_ELIGIBLE":  "The CBA salary ceiling a player qualifies for by experience (25 / 30 / 35% of cap)",
+    "DRAFT_POSITION":    "Where a player was drafted — pedigree the market keeps paying for years later",
+    "EXPERIENCE":        "Seasons in the league — one of the single biggest salary drivers",
+
+    # --- core role / availability ---
+    "MIN":        "Per-game minutes — the model's proxy for role and trust",
+    "TOTAL_MIN":  "Total season minutes (per-game × games) — a durability / availability signal",
+    "GP":         "Games played — availability",
+    "L":          "Team losses in the player's games — a team-context signal",
+    "TOUCHES":    "Total times a player touches the ball — overall involvement",
+    "FT_AST":     "Passes that lead to a teammate's free throws",
+    "DD2":        "Double-doubles on the season",
+    "USG_PCT":    "Usage rate — share of team possessions a player ends",
+
+    # --- impact / team ratings ---
+    "PIE":         "Player Impact Estimate — a box-score composite of a player's share of the game's positive events",
+    "OFF_RATING":  "Team points scored per 100 possessions while the player is on the floor",
+    "DEF_RATING":  "Team points allowed per 100 possessions while the player is on the floor (lower = better)",
+    "NET_RATING":  "Team point differential per 100 possessions while on the floor",
+    "PLUS_MINUS":  "On-court point differential",
+    "E_PACE":      "Estimated possessions per 48 minutes while on the floor (team tempo)",
+
+    # --- speed / movement (SportVU) ---
+    "AVG_SPEED":     "Average movement speed while on the floor (mph)",
+    "AVG_SPEED_OFF": "Average speed on offense (mph)",
+    "AVG_SPEED_DEF": "Average speed on defense (mph)",
+
+    # --- shooting: catch-and-shoot ---
+    "CATCH_SHOOT_FG_PCT":  "Field goal % on catch-and-shoot attempts (no dribbles)",
+    "CATCH_SHOOT_EFG_PCT": "Effective FG% on catch-and-shoot attempts (weights 3s)",
+
+    # --- hustle stats ---
+    "LOOSE_BALLS_RECOVERED":     "Loose balls recovered — a hustle stat",
+    "OFF_LOOSE_BALLS_RECOVERED": "Loose balls recovered on offense — a hustle stat",
+    "DEF_BOXOUTS":               "Defensive box-outs — sealing an opponent off the glass",
+    "OFF_BOXOUTS":               "Offensive box-outs — sealing for an offensive rebound",
+    "SCREEN_ASSISTS":            "Screens that directly lead to a teammate's made basket",
+    "DEFLECTIONS":               "Times a player gets a hand on the ball on defense",
+    "CONTESTED_SHOTS":           "Opponent shots a player contested",
+    "CONTESTED_SHOTS_3PT":       "Opponent 3-pt shots a player contested",
+
+    # --- defensive tracking: opponent shooting when this player defends ---
+    "D_FGM":            "Field goals made by opponents this player defended",
+    "DEF_RIM_FGM":      "Made field goals allowed at the rim when this player defends",
+    "DEF2_FREQ":        "How often this player defends 2-pt attempts",
+    "DEF2_NS_FG2_PCT":  "Opponent 2-pt % on clean attempts a player defended (lower = better interior deterrence)",
+    "DEF3_FG3_PCT":     "Opponent 3-pt % on attempts this player defended (lower = better perimeter defense)",
+    "DEF3_NS_FG3_PCT":  "Opponent 3-pt % on clean attempts this player defended (lower = better)",
+    "DEFGT15_FGA_GT_15":   "Opponent attempts a player defends from 15+ ft away",
+    "DEFGT15_FGM_GT_15":   "Opponent makes a player defends from 15+ ft away",
+    "DEFGT15_NS_GT_15_PCT":"Opponent % on clean 15+ ft shots a player defends (lower = better)",
+    "DEFLT10_FREQ":     "How often a player defends shots inside 10 ft",
+    "DEFLT10_LT_10_PCT":"Opponent % on shots inside 10 ft a player defends (lower = better)",
+    "DEFLT6_FREQ":      "How often a player defends shots inside 6 ft",
+    "DEFLT6_LT_06_PCT": "Opponent % on shots inside 6 ft a player defends (lower = rim protection)",
+    "DEF_WS":           "Defensive win shares — an estimate of wins from a player's defense",
+
+    # --- opponent points allowed on-court ---
+    "OPP_PTS_OFF_TOV":     "Opponent points off turnovers allowed while on the floor (lower = better)",
+    "OPP_PTS_2ND_CHANCE":  "Opponent second-chance points allowed while on the floor (lower = better)",
+    "OPP_PTS_FB":          "Opponent fast-break points allowed while on the floor (lower = better)",
+
+    # --- shot-location makes/pcts (from the shot-location dashboard) ---
+    "In_The_Paint_Non_RA_FGM": "Field goals made in the paint but outside the restricted area (floaters / short mid-range)",
+    "Mid_Range_FGM":           "Mid-range field goals made",
+    "Mid_Range_FG_PCT":        "Mid-range field goal %",
+}
+
+# Clutch stats share a pattern: "<stat>, in clutch minutes (last 5 min, margin ≤5)"
+CLUTCH_BASE = {
+    "BLK": "blocks", "BLKA": "shots blocked by opponents (blocked attempts)",
+    "DEF_RATING": "team defensive rating", "DREB_PCT": "defensive rebound %",
+    "E_PACE": "estimated pace", "PACE": "pace", "FG3M": "3-pt field goals made",
+    "FTA": "free throws attempted", "PF": "personal fouls", "POSS": "possessions played",
+    "REB": "rebounds", "TM_TOV_PCT": "team turnover %",
+}
+
+
+def _try_core_stat(core, season_phrase, time_phrase):
+    """Exact-match the stripped core against CORE_STAT_DEFS and clutch stats."""
+    # clutch family: CLUTCH_<STAT>
+    if core.startswith("CLUTCH_"):
+        rest = core[len("CLUTCH_"):]
+        phrase = CLUTCH_BASE.get(rest)
+        if phrase:
+            s = phrase[0].upper() + phrase[1:]
+            return f"{s}, in clutch minutes (last 5 min, margin ≤ 5)" + season_phrase + time_phrase + "."
+        # unknown clutch stat — still better than "tracked stat"
+        return "A clutch-situation stat (last 5 min, margin ≤ 5)" + season_phrase + time_phrase + "."
+    if core in CORE_STAT_DEFS:
+        return CORE_STAT_DEFS[core] + season_phrase + time_phrase + "."
+    return None
+
+
+# ---------------------------------------------------------------------------
 # 4. SEASON / LAG SUFFIXES
 # ---------------------------------------------------------------------------
 def _strip_time(f):
@@ -204,6 +310,11 @@ def compose_definition(feature, curated=None):
     touch = _try_touch_context(core, season_phrase, time_phrase)
     if touch:
         return touch
+
+    # 2c) Exact-match core stats (defensive tracking, hustle, clutch, ratings, box score)
+    core_hit = _try_core_stat(core, season_phrase, time_phrase)
+    if core_hit:
+        return core_hit
 
     # 3) Compose from parts
     remainder = core
