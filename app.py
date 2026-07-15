@@ -3,8 +3,9 @@ Market Value — NBA salary vs. the market's price for a player's profile.
 Dark broadcast-graphics build.
 
 Reads precomputed artifacts (no model at runtime):
-  data/app_meta_v1.parquet  — per player-season: actual %, predicted %, residual $
-  data/shap_v1.parquet      — long: per (player-season, feature) SHAP dollar contribution
+  data/app_meta_v2.parquet         — box-only: per player-season actual %, predicted %, residual $
+  data/shap_v2.parquet             — box-only long SHAP
+  data/app_meta_v2_lebron.parquet  — LEBRON model predictions (for the impact-lens comparison)
 
 Run:  python3 -m streamlit run app.py
 """
@@ -55,6 +56,19 @@ st.markdown(f"""
 def load():
     return pd.read_parquet("data/app_meta_v2.parquet"), pd.read_parquet("data/shap_v2.parquet")
 
+@st.cache_data
+def load_lebron_comparison():
+    """Box-only vs LEBRON predictions, merged. The disagreement is the impact lens."""
+    box = (pd.read_parquet("data/app_meta_v2.parquet")
+             [["PLAYER_NAME", "SEASON", "pred_pct_cap"]]
+             .rename(columns={"pred_pct_cap": "pred_boxonly"}))
+    leb = (pd.read_parquet("data/app_meta_v2_lebron.parquet")
+             [["PLAYER_NAME", "SEASON", "pred_pct_cap", "pct_cap"]]
+             .rename(columns={"pred_pct_cap": "pred_lebron", "pct_cap": "actual"}))
+    cmp = box.merge(leb, on=["PLAYER_NAME", "SEASON"])
+    cmp["lebron_effect"] = cmp["pred_lebron"] - cmp["pred_boxonly"]
+    return cmp
+
 def nice_feature(f):
     return ((f.replace("_rs", " (reg. season)").replace("_po", " (playoffs)")
               .replace("_lag1", " · prior yr").replace("_lag2", " · 2 yrs prior")
@@ -86,7 +100,7 @@ st.markdown('<div class="sub">A model trained on a decade of contracts learns ho
             unsafe_allow_html=True)
 st.markdown('<hr class="hair">', unsafe_allow_html=True)
 
-view = st.radio("View", ["Player", "League ladder"], horizontal=True, label_visibility="collapsed")
+view = st.radio("View", ["Player", "League ladder", "Impact lens"], horizontal=True, label_visibility="collapsed")
 st.write("")
 
 if view == "Player":
@@ -97,7 +111,7 @@ if view == "Player":
     roster = meta[meta["SEASON"] == season].sort_values("PLAYER_NAME")
     with c1:
         player = st.selectbox("Player", roster["PLAYER_NAME"].tolist(),
-                              index=0, placeholder="Type to search a player…",
+                              index=0, placeholder="Type to search a player...",
                               help="Click and type to filter by name")
 
     row = roster[roster["PLAYER_NAME"] == player].iloc[0]
@@ -120,22 +134,16 @@ if view == "Player":
                f"prediction error vs. actual: {money(_err).replace('$', chr(92)+'$')}")
     st.write("")
 
-    # ---- price-summary anchor: baseline → market value (predicted) → actual salary ----
-    # makes "overpaid" legible even when every force-bar is teal: the bars build the market
-    # price up FROM the baseline, and the actual-salary marker sits above/below that price.
     base_usd = float(meta["baseline_pct"].iloc[0]) * season_cap
     summary = go.Figure()
-    # market value bar (what the profile is worth), colored by verdict
     summary.add_trace(go.Bar(
         x=[mkt_usd], y=["price"], orientation="h", width=0.5,
         marker_color=color, marker_line_width=0,
         hovertemplate=f"Market value: {money(mkt_usd)}<extra></extra>", showlegend=False))
-    # baseline marker (where every player starts)
     summary.add_vline(x=base_usd, line_width=1.5, line_dash="dot", line_color=MUTE,
                       annotation_text=f"league baseline {money(base_usd)}",
                       annotation_position="top left",
                       annotation_font=dict(size=10, color=MUTE))
-    # actual-salary marker — the line the bar must clear to be "fairly paid"
     summary.add_vline(x=paid_usd, line_width=2.5, line_color=INK,
                       annotation_text=f"actually paid {money(paid_usd)}",
                       annotation_position="bottom right",
@@ -153,7 +161,7 @@ if view == "Player":
                f"(starting from the league baseline). The black line is the salary actually paid — "
                f"when the bar {'doesn’t reach' if under else 'falls below'} the line, the player is {word.lower()}.")
 
-    if actual > 0.355:  # paid above the highest CBA tier (35% of cap, 10+ yr vets)
+    if actual > 0.355:
         st.info(
             f"**{player.split()[0].title()} is paid above the standard CBA maximum (35% of cap).** "
             "The individual max is tiered by experience — 25% (0–6 yrs), 30% (7–9 yrs), 35% (10+ yrs) — "
@@ -230,7 +238,7 @@ if view == "Player":
             "POST_SF_POSS_PCT": "Share of post-ups drawing a shooting foul.",
             "RM_POSS_PCT": "Share of offense as the roll man in pick-and-roll.",
             "SHOT_FG2M": "Two-point field goals made.",
-            "SC_22_18_FG2A_FREQUENCY": "Shot-attempt rate with 18–22 seconds on the shot clock (early offense).",
+            "SC_22_18_FG2A_FREQUENCY": "Shot-attempt rate with 18-22 seconds on the shot clock (early offense).",
             "DRIBB_2_FG_PCT": "FG% on shots after exactly two dribbles.",
             "DRIBB_0_FG3A_FREQUENCY": "Catch-and-shoot 3-point attempt rate (zero dribbles).",
             "DEFGT15_FGM_GT_15": "Opponent makes a player defends from 15+ ft away.",
@@ -242,7 +250,8 @@ if view == "Player":
         all_feats = sorted(shap["feature"].unique())
         pick = st.selectbox("Look up a factor", all_feats, key="gloss")
         st.markdown(f"**{nice_feature(pick)}**  \n{define(pick)}")
-else:
+
+elif view == "League ladder":
     seasons = sorted(meta["SEASON"].unique(), reverse=True)
     c1, c2 = st.columns([1, 1])
     with c1:
@@ -267,3 +276,55 @@ else:
                  (f"color:{AMBER}" if isinstance(v, (int, float)) and v < 0 else ""), subset=["Gap ($)"]),
         use_container_width=True, height=600)
     st.caption("Gap = market value − actual pay. Teal = market prices the profile above the salary.")
+
+else:  # Impact lens
+    st.markdown('<div class="sub" style="margin-bottom:1rem">The market model prices players on '
+                'box-score production, so it cannot see value that never reaches a stat line — defense, '
+                'screening, spacing, the quiet stuff that moves winning. This lens adds <i>LEBRON</i>, a '
+                'plus-minus impact metric, and shows where the two models <i>disagree</i> on a player\'s '
+                'fair price. That gap is the invisible value, in dollars.<br><br>'
+                '<span style="color:#7d8694">An experiment layered on the market model — the main view '
+                'stays box-only and fully reproducible.</span></div>',
+                unsafe_allow_html=True)
+
+    cmp = load_lebron_comparison()
+    seasons = sorted(cmp["SEASON"].unique(), reverse=True)
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        season = st.selectbox("Season", seasons, index=seasons.index(SEASON_DEFAULT) if SEASON_DEFAULT in seasons else 0)
+    with c2:
+        n = st.selectbox("Players per list", [10, 15, 20, 30], index=2)
+
+    df = cmp[cmp["SEASON"] == season].copy()
+    _cap = SALARY_CAP.get(season, CAP_2526)
+    df["effect_usd"] = df["lebron_effect"] * _cap
+
+    def _display(frame):
+        out = frame[["PLAYER_NAME", "pred_boxonly", "pred_lebron", "lebron_effect", "effect_usd", "actual"]].copy()
+        out["PLAYER_NAME"] = out["PLAYER_NAME"].str.title()
+        out.columns = ["Player", "Box-only", "+ LEBRON", "Shift", "Shift $", "Actual"]
+        return out
+
+    raised = _display(df.nlargest(n, "lebron_effect"))
+    lowered = _display(df.nsmallest(n, "lebron_effect"))
+
+    fmt = {"Box-only": "{:.1%}", "+ LEBRON": "{:.1%}", "Shift": "{:+.1%}",
+           "Shift $": lambda v: f"${v/1e6:+.1f}M", "Actual": "{:.1%}"}
+
+    left, right = st.columns(2)
+    with left:
+        st.markdown("#### Impact raises them")
+        st.caption("Box score underrates their winning impact")
+        st.dataframe(raised.style.format(fmt)
+                     .map(lambda v: f"color:{TEAL}", subset=["Shift", "Shift $"]),
+                     use_container_width=True, hide_index=True, height=560)
+    with right:
+        st.markdown("#### Impact lowers them")
+        st.caption("Box score overrates them — volume without impact")
+        st.dataframe(lowered.style.format(fmt)
+                     .map(lambda v: f"color:{AMBER}", subset=["Shift", "Shift $"]),
+                     use_container_width=True, hide_index=True, height=560)
+
+    st.caption("Sorted by how much LEBRON moves each player's predicted price — the disagreement between the "
+               "two models, the value the box score can't see. Across seasons the driver is WAR (total winning "
+               "contribution), not the offense/defense split — and it's individual, not archetypal.")
