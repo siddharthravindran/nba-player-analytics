@@ -89,7 +89,6 @@ season." The injury, isolated in one bar.
 
 <img width="2288" height="1592" alt="8EE7920E-113D-4DF1-8993-D3E01174000F" src="https://github.com/user-attachments/assets/474e58ab-4a9b-46d2-b3ce-ea5be77d5ad1" />
 
-
 ## Limitations (by design, not bugs)
 
 A market model built on individual box-score production has structural blind spots, and naming them is part
@@ -103,6 +102,44 @@ of the analysis:
   player to recent history, which a breakout by definition contradicts.
 - **The very top is set by credentials and scarcity**, not just production — which is why the All-NBA
   credential feature exists, and why it narrows but doesn't fully close the gap at the ceiling.
+
+## Measuring the blind spot: an impact-metric variant
+
+The limitations above aren't hypothetical — the biggest one (value the box score can't see) is measurable.
+To measure it, I built a **second model identical to the first, plus one addition: LEBRON**, a plus-minus
+impact metric (BBall Index), added as leak-safe prior-season features. Where the two models *disagree* on a
+player's fair price is the invisible value, quantified — the box score's blind spot, in dollars.
+
+This is deliberately a **study, not a replacement**: the deployed model stays box-only and fully reproducible,
+consistent with the market-pricing thesis. The impact model is a lens applied to it.
+
+**Method**
+- Two-model A/B — box-only vs. box + LEBRON, same target and population; the prediction gap is the signal.
+- Cohort SHAP analysis to decompose *which* impact signal drives the disagreement.
+- Cross-season validation across four seasons (2022-23 → 2025-26).
+
+**Findings**
+- **The disagreement is basketball-coherent.** LEBRON raises players whose winning impact outstrips their
+  box score — invisible-value defenders (Alex Caruso, Derrick White, Ausar Thompson, Lu Dort, Jaden
+  McDaniels), spacing and rim-protecting bigs (Myles Turner, Al Horford, Kristaps Porzingis, Lauri Markkanen,
+  Brook Lopez), and high-impact stars whose effect tops even their box score (Giannis, Curry) — and lowers
+  empty-volume scorers (Jordan Poole, Devin Vassell, Jalen Green, Kyle Kuzma). These lists fell out of the
+  model-to-model disagreement; they weren't hand-picked.
+- **WAR is the signal carrier — not the offense/defense split.** Decomposing the LEBRON features via cohort
+  SHAP, the offense/defense components contribute almost nothing; it's *WAR* (wins above replacement,
+  combining per-possession impact with availability) doing the work. The market underprices total winning
+  contribution, not "defense" as a category.
+- **The mispricing is individual, not archetypal.** Grouping by LEBRON role or offense/defense tilt washed
+  out entirely — two players of the same type sit at opposite ends of the disagreement. The inefficiency
+  persists *because* it's idiosyncratic; if it reduced to a type, teams would have arbitraged it away.
+- **A correction, not a revolution.** Adding a strong impact metric barely moved aggregate accuracy
+  (R2 0.840 vs. 0.845 box-only). Impact refines market pricing at the margins — the market prices production
+  first. That modest effect is itself the finding.
+
+**Alex Caruso, 2025-26:** the box-only model prices him at 4.8% of the cap (~$7.4M); adding impact raises
+that to 6.8% (~$10.5M). His defensive LEBRON is elite (+1.9) while his offensive LEBRON is slightly negative
+— the box score can't see why he's worth paying, but the impact model can. He actually earns 11.7%, so both
+models flag him underpaid; impact closes roughly a third of the gap the box score left open.
 
 ## Tech stack
 
@@ -155,16 +192,17 @@ scatter_nba_stats(df, x_stat="USG_PCT", y_stat="TS_PCT", season="2024-25", min_g
 - [x] Salary data ingestion (BBR scrape) + player-identity join
 - [x] Salary model + residual analysis (R² 0.845, out-of-time)
 - [x] Interactive app (per-player SHAP waterfall + league ladder)
-- [ ] Results write-up / article
-- [ ] v2: forward model on already-signed future contracts
+- [x] Results write-up / [article](https://medium.com/@siddharthravindran/i-built-a-model-that-prices-nba-players-the-way-the-market-actually-does-and-the-interesting-part-1b71dbc77e6f)
+- [x] LEBRON impact-comparison model — cohort SHAP analysis of where plus-minus impact reveals market mispricing
+- [ ] LEBRON impact tab in app (disagreement leaderboard + per-player impact view)
+- [ ] Follow-up write-up on the LEBRON findings (drafted)
+- [ ] v2: forward model on already-signed 2026-27 contracts
 
 ## Roadmap (v2)
 
 - **Forward model:** validate against real future contracts (already scraped, 2026-31) — "is the salary a
   player is *already locked into* a bargain, given current production?"
 - **Rookie-scale flag** to separate "underpaid by rule" from "underpaid by market."
-- **An impact-metric variant** (RAPM/EPM) as an explicit study: does adding an impact metric improve
-  market-price prediction, and where? — directly engaging the role-value blind spot.
 
 ## Notes
 
