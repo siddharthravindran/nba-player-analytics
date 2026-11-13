@@ -9,7 +9,8 @@
     voters.weights                                         # what voters reward, largest first
     voters.check                                           # one row per season: hits out of 15
     predict_allstars(voters, df_master, model)             # 12 a conference plus the next five, same voting model
-    pick_all_defense(model, df_master)                     # two teams of five by defensive impact (not a voting model)
+    pick_all_defense(model, df_master)                     # All-Defensive teams, from a second model trained on that vote
+    fit_alldefense_model(df_master, model).weights         # what All-Defensive voters reward
 
 player_ranking answers "who has played best". This answers a different
 question: given how voters have behaved since 2015-16, who gets a spot. The two
@@ -35,7 +36,8 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-from nba_viz_utils import norm_name
+from bbref_stats import DATA_DIR, _get
+from nba_viz_utils import SEASONS, norm_name
 from player_ranking import _regular_season, rank_players
 from salaries import ALLNBA_WEIGHT, _allnba_selections
 
@@ -44,17 +46,27 @@ VOTER_STATS = ["PTS", "REB", "AST", "STL", "BLK", "TS_PCT", "USG_PCT", "MIN", "W
 LABELS = {"PTS": "scoring", "REB": "rebounds", "AST": "assists", "STL": "steals", "BLK": "blocks",
           "TS_PCT": "efficiency", "USG_PCT": "usage", "MIN": "minutes", "W_PCT": "team record", "PIE": "all-round production",
           "BBR_BPM": "BPM", "GP_SHARE": "games played", "RATING": "impact rating", "WINS_PACE": "wins added",
-          "PRIOR": "past All-NBA teams"}
+          "PRIOR": "past selections"}
+DEFENSE_STATS = ["STL", "BLK", "DEFLECTIONS", "CONTESTED_SHOTS", "CHARGES_DRAWN", "DREB_PCT", "PCT_PLUSMINUS", "D_FG_PCT",
+                 "DEF_RIM_FGA", "DEF_RIM_FG_PCT", "DEF_RATING", "ONOFF_DEF_RATING", "DEF_WS", "MIN", "GP_SHARE", "W_PCT",
+                 "BBR_DBPM", "D_RATING", "PRIOR"]
+LABELS.update({"DEFLECTIONS": "deflections", "CONTESTED_SHOTS": "shots contested", "CHARGES_DRAWN": "charges drawn",
+               "DREB_PCT": "defensive rebounding", "PCT_PLUSMINUS": "opponents shooting below their norm",
+               "D_FG_PCT": "opponent FG%", "DEF_RIM_FGA": "rim shots defended", "DEF_RIM_FG_PCT": "opponent FG% at the rim",
+               "DEF_RATING": "team defense with him on", "ONOFF_DEF_RATING": "defense on vs off court",
+               "DEF_WS": "defensive win shares", "BBR_DBPM": "defensive BPM", "D_RATING": "defensive impact rating"})
 POOL_MIN, POOL_GP_SHARE = 24.0, 0.45         # every All-NBA player since 2015-16 clears both
+DEFENSE_POOL_MIN = 20.0                      # All-Defensive specialists play less
 GAMES_RULE_FROM, GAMES_RULE, SEASON_GAMES = "2023-24", 65, 82
 # The league's count is not always the stat sheet's: in 2025-26 three First Team players show 64 games here
 # (two won "extraordinary circumstances" appeals). One game of slack keeps the filter from ruling out real picks.
 GAMES_SLACK = 1
 PENALTIES = (0.01, 0.03, 0.1, 0.3, 1.0)
 TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
+DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "pick_all_defense"]
+__all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense"]
 
 
 @dataclass
@@ -65,16 +77,47 @@ class AllNBAModel:
     seasons: list
     check: pd.DataFrame = field(default=None, repr=False)      # leave-one-season-out results
     missed: pd.DataFrame = field(default=None, repr=False)     # every wrong call in those runs
+    award: str = "nba"                                         # "nba" or "defense"
 
 
-def _voter_table(df_master, rating_model):
+def _alldefense_selections(refresh=False):
+    """All-Defensive teams from Basketball-Reference, one row per selection: name_key, yr, weight (1st = 2, 2nd = 1)."""
+    cache = DATA_DIR / "alldefense_raw.parquet"
+    if cache.exists() and not refresh:
+        raw = pd.read_parquet(cache)
+    else:
+        from io import StringIO
+        html = _get("https://www.basketball-reference.com/awards/all_defense.html")
+        start = html.find('<table', html.find('id="div_awards_all_defense"'))
+        raw = pd.read_html(StringIO(html[start:html.find("</table>", start) + 8]))[0]
+        raw.columns = [str(c) for c in raw.columns]
+        raw = raw.astype(object).where(raw.notna(), None).astype("string")
+        raw.to_parquet(cache)
+    raw = raw[raw["Lg"] == "NBA"]
+    long = raw.melt(id_vars=["Season", "Tm"], value_vars=[c for c in raw.columns if c.startswith("Unnamed")],
+                    value_name="player").dropna(subset=["player"])
+    long["name_key"] = long["player"].str.replace(r"\s*\(T\)$", "", regex=True).map(norm_name)
+    long = long[long["Season"].isin(SEASONS)]
+    long["yr"] = long["Season"].str[:4].astype(int)
+    long["weight"] = long["Tm"].map({"1st": 2, "2nd": 1})
+    return long[["name_key", "yr", "weight"]]
+
+
+_AWARDS = {   # award -> (selections, stats, minimum minutes, team labels)
+    "nba": (_allnba_selections, VOTER_STATS, POOL_MIN, TEAM_NAMES),
+    "defense": (_alldefense_selections, DEFENSE_STATS, DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
+}
+
+
+def _voter_table(df_master, rating_model, award="nba"):
     """One row per rotation player per season with the stats voters see, and what the voters did."""
+    selections, stats, pool_min, _ = _AWARDS[award]
     df = _regular_season(df_master)
     parts = []
     for season in sorted(df["SEASON"].unique()):
         rated = rank_players(rating_model, df_master, season, min_min=0, min_gp=0).set_index("PLAYER_ID")
         one = df[df["SEASON"] == season].set_index("PLAYER_ID")
-        one = one.join(rated[["RATING", "WINS_82"]].rename(columns={"WINS_82": "WINS_PACE"}), how="inner")
+        one = one.join(rated[["RATING", "D_RATING", "WINS_82"]].rename(columns={"WINS_82": "WINS_PACE"}), how="inner")
         team_games = one.groupby("TEAM_ABBREVIATION")["GP"].transform("max").clip(lower=1)
         most = min(one["GP"].max(), SEASON_GAMES)             # a traded player can appear in 83 or 84
         # a finished season is judged against the league's schedule; one in progress against his own team's
@@ -86,7 +129,7 @@ def _voter_table(df_master, rating_model):
     table["name_key"] = table["PLAYER_NAME"].map(norm_name)
     table["yr"] = table["SEASON"].str[:4].astype(int)
 
-    picks = _allnba_selections()
+    picks = selections()
     made = picks.set_index(["name_key", "yr"])["weight"]
     table["VOTES"] = [made.get(k, 0) for k in zip(table["name_key"], table["yr"])]
     table["VOTES"] = table["VOTES"].fillna(0).astype(int)
@@ -98,12 +141,13 @@ def _voter_table(df_master, rating_model):
         prior.append(0 if g is None else g.loc[(g["yr"] < year) & (g["yr"] >= year - 3), "weight"].sum())
     table["PRIOR"] = prior
 
-    pool = table[(table["MIN"] >= POOL_MIN) & (table["GP_SHARE"] >= POOL_GP_SHARE)].copy()
+    pool = table[(table["MIN"] >= pool_min) & (table["GP_SHARE"] >= POOL_GP_SHARE)].copy()
     left_out = table[(table["VOTES"] > 0) & ~table.index.isin(pool.index)]
     if len(left_out):
-        print(f"⚠️ {len(left_out)} All-NBA players fall outside the pool: "
+        print(f"⚠️ {len(left_out)} selected players fall outside the pool: "
               f"{left_out[['PLAYER_NAME', 'SEASON']].values.tolist()[:5]}")
-    X = pool[VOTER_STATS].astype(float)
+    pool["STOCKS"] = pd.to_numeric(pool["STL"], errors="coerce") + pd.to_numeric(pool["BLK"], errors="coerce")
+    X = pool[stats].apply(pd.to_numeric, errors="coerce").astype(float)
     by_season = X.groupby(pool["SEASON"])
     Z = ((X - by_season.transform("mean")) / by_season.transform("std").replace(0, np.nan)).clip(-5, 5).fillna(0)
     return pool, Z
@@ -115,12 +159,12 @@ def _can_reach(pool):
     return (pool["SEASON"] < GAMES_RULE_FROM) | (pool["GP"] + left >= GAMES_RULE - GAMES_SLACK)
 
 
-def _teams(chance, eligible):
-    """The 15 highest chances among eligible players, five to a team."""
-    order = chance[eligible].sort_values(ascending=False).index[:15]
+def _teams(chance, eligible, names=TEAM_NAMES):
+    """The highest chances among eligible players, five to a team."""
+    order = chance[eligible].sort_values(ascending=False).index[:5 * len(names)]
     out = pd.Series("", index=chance.index)
     for i, idx in enumerate(order):
-        out[idx] = TEAM_NAMES[3 - i // 5]
+        out[idx] = names[len(names) - i // 5]
     return out
 
 
@@ -131,7 +175,28 @@ def fit_allnba_model(df_master, rating_model, penalty=None, verbose=True):
     inputs, so the voting model can learn how much voters follow impact.
     penalty=None picks the regularisation by leaving out one season at a time.
     """
-    pool, Z = _voter_table(df_master, rating_model)
+    return _fit_votes(df_master, rating_model, "nba", penalty, verbose, "All-NBA",
+                      {"BY_WINS": "WINS_PACE", "BY_BPM": "BBR_BPM", "BY_POINTS": "PTS"},
+                      "the top 15 by wins added gets {BY_WINS}, by BPM {BY_BPM}, by points per game {BY_POINTS}")
+
+
+def fit_alldefense_model(df_master, rating_model, penalty=None, verbose=True):
+    """Train the All-Defensive voting model, the same way as fit_allnba_model but on that vote and defensive stats.
+
+    Ten spots a season instead of fifteen, so there is less to learn from and
+    it is the less accurate of the two; .check has the season-by-season test.
+    PRIOR here is All-Defensive selections in the previous three seasons.
+    """
+    return _fit_votes(df_master, rating_model, "defense", penalty, verbose, "All-Defensive",
+                      {"BY_D_RATING": "D_RATING", "BY_DBPM": "BBR_DBPM", "BY_STOCKS": "STOCKS"},
+                      "the top 10 by defensive impact rating gets {BY_D_RATING}, by defensive BPM {BY_DBPM}, "
+                      "by steals plus blocks {BY_STOCKS}")
+
+
+def _fit_votes(df_master, rating_model, award, penalty, verbose, title, yardsticks, yardstick_text):
+    stats, names = _AWARDS[award][1], _AWARDS[award][3]
+    spots = 5 * len(names)
+    pool, Z = _voter_table(df_master, rating_model, award)
     known = pool["DECIDED"].to_numpy()
     y = (pool["VOTES"] > 0).to_numpy()
     seasons = sorted(pool.loc[known, "SEASON"].unique())
@@ -157,14 +222,14 @@ def fit_allnba_model(df_master, rating_model, penalty=None, verbose=True):
     rows, missed = [], []
     for s in seasons:
         here = (pool["SEASON"] == s).to_numpy()
-        team = _teams(chance[here], eligible[here])
-        real = pool.loc[here, "VOTES"].map(TEAM_NAMES).fillna("")
+        team = _teams(chance[here], eligible[here], names)
+        real = pool.loc[here, "VOTES"].map(names).fillna("")
         hit = (team != "") & (real != "")
-        by = lambda col: set(pool.loc[here].nlargest(15, col).index)            # simple yardsticks
+        by = lambda col: set(pool.loc[here].nlargest(spots, col).index)         # simple yardsticks
         actual = set(real[real != ""].index)
-        rows.append({"SEASON": s, "RIGHT_OF_15": int(hit.sum()), "FIRST_TEAM_OF_5": int(((team == "1st") & (real == "1st")).sum()),
+        rows.append({"SEASON": s, f"RIGHT_OF_{spots}": int(hit.sum()), "FIRST_TEAM_OF_5": int(((team == "1st") & (real == "1st")).sum()),
                      "SAME_TEAM": int(((team == real) & hit).sum()),
-                     "BY_WINS": len(by("WINS_PACE") & actual), "BY_BPM": len(by("BBR_BPM") & actual), "BY_POINTS": len(by("PTS") & actual)})
+                     **{name: len(by(col) & actual) for name, col in yardsticks.items()}})
         wrong = (team != "") ^ (real != "")
         for idx in wrong[wrong].index:
             missed.append({"SEASON": s, "Player": pool.at[idx, "PLAYER_NAME"], "PROJECTED": team[idx], "ACTUAL": real[idx],
@@ -172,27 +237,26 @@ def fit_allnba_model(df_master, rating_model, penalty=None, verbose=True):
     check = pd.DataFrame(rows)
 
     fit = LogisticRegression(C=penalty, max_iter=5000).fit(Z[known], y[known])
-    weights = pd.Series(fit.coef_[0], index=VOTER_STATS).sort_values(key=np.abs, ascending=False)
+    weights = pd.Series(fit.coef_[0], index=stats).sort_values(key=np.abs, ascending=False)
     if verbose:
-        n = len(seasons) * 15
-        print(f"\nAll-NBA voting model: {int(y[known].sum())} selections over {len(seasons)} seasons, "
+        n, right = len(seasons) * spots, check[f"RIGHT_OF_{spots}"]
+        print(f"\n{title} voting model: {int(y[known].sum())} selections over {len(seasons)} seasons, "
               f"{int(known.sum())} player-seasons, penalty C={penalty:g}")
-        print(f"Each season predicted without seeing it: {check['RIGHT_OF_15'].sum()} of {n} spots right "
-              f"({check['RIGHT_OF_15'].mean():.1f} of 15 a season), first team {check['FIRST_TEAM_OF_5'].sum()} of {len(seasons) * 5}")
-        print(f"  for comparison, the top 15 by wins added gets {check['BY_WINS'].sum()}, by BPM {check['BY_BPM'].sum()}, "
-              f"by points per game {check['BY_POINTS'].sum()}")
+        print(f"Each season predicted without seeing it: {right.sum()} of {n} spots right "
+              f"({right.mean():.1f} of {spots} a season), first team {check['FIRST_TEAM_OF_5'].sum()} of {len(seasons) * 5}")
+        print("  for comparison, " + yardstick_text.format(**{k: check[k].sum() for k in yardsticks}))
         print("What voters reward most: " + ", ".join(f"{LABELS[k]} ({v:+.2f})" for k, v in weights.head(6).items()))
-    return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, pd.DataFrame(missed))
+    return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, pd.DataFrame(missed), award)
 
 
 def _voter_scores(voters, df_master, rating_model, season):
     """One season's rotation players, each stat's pull on the vote, and the chance of an All-NBA spot."""
-    pool, Z = _voter_table(df_master, rating_model)
+    pool, Z = _voter_table(df_master, rating_model, voters.award)
     here = (pool["SEASON"] == season).to_numpy()
     if not here.any():
         raise ValueError(f"no rotation players for {season}")
     pool, Z = pool[here], Z[here]
-    pull = Z * voters.weights.reindex(VOTER_STATS)
+    pull = Z * voters.weights.reindex(Z.columns)
     chance = pd.Series(1 / (1 + np.exp(-(pull.sum(axis=1) + voters.intercept))), index=pool.index)
     return pool, pull, chance
 
@@ -267,46 +331,44 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
     return out
 
 
-def pick_all_defense(rating_model, df_master, season="2026-27", top=20):
-    """All-Defensive teams by defensive impact: the ten best eligible defenders, five to a team.
+_defense_cache = {}
 
-    DEF_SCORE  the average of two opinions, each measured against the pool: this model's
-               D_RATING and Basketball-Reference's defensive BPM (when the master has it)
-    TEAM       1st / 2nd for the ten highest eligible scores
-    The rest are context: steals, blocks and deflections per game, how far below
-    their usual percentage opponents shoot against him (OPP_FG_DIFF, negative is
-    good), and what they shoot at the rim.
 
-    This is NOT a voting model — the data has no All-Defensive history to learn
-    from, so it says who has defended best by the numbers, not who voters will
-    name. Voters lean on reputation and on team defense; this doesn't. Same pool
-    as the other awards (24+ minutes, about half his team's games) and the same
-    65-game rule.
+def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=None):
+    """All-Defensive teams: each player's chance of a spot, best first, with the two projected teams.
+
+    CHANCE     probability of making either team, from the All-Defensive voting model
+    PROJECTED  1st / 2nd for the ten most likely eligible players
+    ACTUAL     what happened, for seasons already voted on
+    WHY        what is pushing his chance up the most
+    The rest are context: this model's D_RATING, defensive BPM, steals, blocks
+    and deflections per game, how far below their usual percentage opponents
+    shoot against him (OPP_FG_DIFF, negative is good) and what they shoot at
+    the rim.
+
+    voters: a model from fit_alldefense_model; fitted here (once per master)
+    when not given. Same 65-game rule as All-NBA. Reputation counts for a lot
+    in this vote, so a first-time candidate is rated lower than his numbers.
     """
-    pool, _ = _voter_table(df_master, rating_model)
-    pool = pool[pool["SEASON"] == season].copy()
-    if pool.empty:
-        raise ValueError(f"no rotation players for {season}")
-    rated = rank_players(rating_model, df_master, season, min_min=0, min_gp=0).set_index("PLAYER_ID")
-    pool["D_RATING"] = pool["PLAYER_ID"].map(rated["D_RATING"])
-    z = lambda s: (s - s.mean()) / s.std()
-    views = [z(pool["D_RATING"])]
-    if "BBR_DBPM" in pool.columns and pool["BBR_DBPM"].notna().mean() > 0.5:
-        views.append(z(pd.to_numeric(pool["BBR_DBPM"], errors="coerce")))
-    pool["DEF_SCORE"] = pd.concat(views, axis=1).mean(axis=1)
+    if voters is None:
+        key = (id(df_master), id(rating_model))
+        if key not in _defense_cache:
+            _defense_cache.clear()
+            _defense_cache[key] = fit_alldefense_model(df_master, rating_model, verbose=False)
+        voters = _defense_cache[key]
+    pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
     eligible = _can_reach(pool)
-    order = pool.loc[eligible, "DEF_SCORE"].sort_values(ascending=False).index[:10]
-    team = pd.Series("", index=pool.index)
-    team[order[:5]], team[order[5:]] = "1st", "2nd"
-
     get = lambda c: pd.to_numeric(pool[c], errors="coerce") if c in pool.columns else np.nan
     out = pd.DataFrame({
-        "Player": pool["PLAYER_NAME"], "TEAM_ABBR": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int), "MIN": pool["MIN"],
-        "TEAM": team, "DEF_SCORE": pool["DEF_SCORE"], "D_RATING": pool["D_RATING"], "DBPM": get("BBR_DBPM"),
-        "STL": get("STL"), "BLK": get("BLK"), "DEFLECTIONS": get("DEFLECTIONS"),
-        "OPP_FG_DIFF": get("PCT_PLUSMINUS"), "RIM_FG_PCT": get("DEF_RIM_FG_PCT"), "CAN_REACH_65": eligible,
+        "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int), "MIN": pool["MIN"],
+        "CHANCE": chance, "PROJECTED": _teams(chance, eligible, DEFENSE_TEAM_NAMES), "CAN_REACH_65": eligible,
+        "D_RATING": pool["D_RATING"], "DBPM": get("BBR_DBPM"), "STL": get("STL"), "BLK": get("BLK"),
+        "DEFLECTIONS": get("DEFLECTIONS"), "OPP_FG_DIFF": get("PCT_PLUSMINUS"), "RIM_FG_PCT": get("DEF_RIM_FG_PCT"),
+        "WHY": [_reasons(r, 1) for _, r in pull.iterrows()],
     })
-    out = out.sort_values("DEF_SCORE", ascending=False).reset_index(drop=True)
+    if pool["DECIDED"].any():
+        out.insert(6, "ACTUAL", pool["VOTES"].map(DEFENSE_TEAM_NAMES).fillna(""))
+    out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out))
     return out.head(top) if top else out
