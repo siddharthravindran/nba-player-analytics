@@ -17,7 +17,9 @@ import requests
 from io import StringIO
 from bs4 import BeautifulSoup, Comment
 from unidecode import unidecode
+import glob
 
+from nba_api.stats.library.http import NBAStatsHTTP
 from nba_api.stats.endpoints import (
     LeagueDashPlayerStats,
     LeagueDashPtStats,
@@ -25,8 +27,10 @@ from nba_api.stats.endpoints import (
     CommonAllPlayers,
     LeagueDashPlayerPtShot,
     LeagueDashPlayerBioStats,
-    LeagueHustleStatsPlayer
+    LeagueHustleStatsPlayer,
+    TeamPlayerOnOffSummary,
 )
+from nba_api.stats.static import teams as _static_teams
 
 # =============================================================================
 # SECTION 1: NBA.com CONSTANTS & CONFIG
@@ -40,17 +44,32 @@ FIG_DIR   = PROJECT_DIR / "figures"
 for d in [CACHE_DIR, DATA_DIR, FIG_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
-minimal_headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-    "Referer": "https://www.nba.com/"
+# stats.nba.com drops API requests that don't look like they came from the site's
+# own front end — not with a 429 or an error page, it just never answers, so the
+# connection hangs until the read timeout fires. nba_api 1.10.2 ships most of the
+# browser headers in STATS_HEADERS but not these three, so add them to its session
+# once here, at import. NBAStatsHTTP.headers is a class attribute and the calls in
+# this module never pass headers= of their own, so every endpoint picks these up.
+NBA_STATS_HEADERS = {
+    "Origin": "https://www.nba.com",
+    "x-nba-stats-origin": "stats",
+    "x-nba-stats-token": "true",
 }
+NBAStatsHTTP.headers.update(NBA_STATS_HEADERS)
 
 SALARY_CAP = {'2015-16':70_000_000,'2016-17':94_143_000,'2017-18':99_093_000,
               '2018-19':101_869_000,'2019-20':109_140_000,'2020-21':109_140_000,
               '2021-22':112_414_000,'2022-23':123_655_000,'2023-24':136_021_000,
-              '2024-25':140_588_000,'2025-26':154_647_000}
+              '2024-25':140_588_000,'2025-26':154_647_000,
+              '2026-27':164_961_000}
 
 SEASONS = tuple(SALARY_CAP.keys())   # one source of truth — add a cap year, the season list follows
+
+# The season currently in progress. should_refresh() reads these, so the cache is
+# bypassed for the live season and reused for everything already final. Bump both
+# when a new season tips off, or the pipeline will keep serving last year's cache.
+ACTIVE_SEASON = "2026-27"
+ACTIVE_SEASON_TYPE = "Regular Season"
 
 PT_STAT_TYPES = {
     'SpeedDistance', 'Rebounding', 'Possessions', 'CatchShoot', 'PullUpShot',
@@ -380,8 +399,8 @@ def cached_fetch(cache_name, fetch_fn, force_refresh=False, retries=3, backoff=2
 
 def should_refresh(season, season_type):
     return (
-        season == "2025-26"
-        and season_type == "Playoffs"
+        season == ACTIVE_SEASON
+        and season_type == ACTIVE_SEASON_TYPE
     )
     
 
@@ -645,7 +664,13 @@ def fetch_nba_stats(
                 df = cached_fetch(cache_name, fetch_raw, force_refresh=refresh_this)
             except Exception as e:
                 print(f"DEBUG: API Error for {stat_type} in {season} ({stype}): {e}")
-                continue
+                df = None
+            finally:
+                # Pause after every request attempt, including the ones that failed. A
+                # `continue` here used to skip the pause, so the moment stats.nba.com
+                # started refusing us the loop stopped backing off and hammered it flat
+                # out — which is what keeps a throttle alive.
+                time.sleep(0.8)
 
             if df is None or df.empty:
                 print(f"DEBUG: No data for {season} ({stype}). Skipping...")
@@ -666,7 +691,6 @@ def fetch_nba_stats(
             df['SEASON_TYPE'] = stype
 
             dfs.append(df)
-            time.sleep(0.8)
 
     if not dfs:
         print(f"DEBUG: No data collected for {stat_type}.")
@@ -685,7 +709,8 @@ def build_bucketed_features(
     season_types=("Regular Season", "Playoffs"),
     exclude_cols=None,
     sleep_time=5,
-    force_refresh=False
+    force_refresh=False,
+    timeout=120
 ):
     if exclude_cols is None:
         exclude_cols = [
@@ -707,11 +732,16 @@ def build_bucketed_features(
                     seasons=seasons,
                     season_type=season_type,
                     force_refresh=force_refresh,
+                    timeout=timeout,
                     **{param_name: b}
                 )
             except Exception as e:
                 print(f"❌ Error fetching {b} ({season_type}): {e}")
-                continue
+                df = None
+            finally:
+                # Same reason as in fetch_nba_stats(): back off after every bucket,
+                # not just the ones that came back with data.
+                time.sleep(sleep_time)
 
             if df is None or df.empty:
                 print(f"⚠️ No data for {b} ({season_type})")
@@ -727,7 +757,6 @@ def build_bucketed_features(
                 season_master = season_master.join(df, how='outer')
 
             print(f"✅ Added {b} ({season_type})")
-            time.sleep(sleep_time)
 
         if season_master is not None:
             season_type_dfs.append(season_master)
@@ -993,6 +1022,146 @@ def fetch_nba_hustle_stats(
     return _consolidate(chunks, "Hustle", source="hustle")
     
     
+ON_OFF_COLS = [
+    'ONCOURT_NET_RATING', 'OFFCOURT_NET_RATING', 'ONOFF_NET_RATING',
+    'ONCOURT_OFF_RATING', 'OFFCOURT_OFF_RATING', 'ONOFF_OFF_RATING',
+    'ONCOURT_DEF_RATING', 'OFFCOURT_DEF_RATING', 'ONOFF_DEF_RATING',
+    'ONCOURT_MIN', 'OFFCOURT_MIN',
+]
+
+
+def fetch_nba_on_off(
+    seasons,
+    season_type="Regular Season",
+    per_mode="PerGame",
+    timeout=120,
+    force_refresh=False,
+    team_ids=None,
+):
+    """Team net rating with each player on the court vs off it (nba.com On/Off).
+
+    The endpoint is per team, so this is one request per team per season and
+    season type (30 for a regular season). `team_ids` limits it to those teams.
+    One row per player per team.
+
+    Columns (all per 100 possessions except the minutes):
+      ONCOURT_*  team rating while he plays      OFFCOURT_*  while he sits
+      ONOFF_NET_RATING = on minus off — the swing. Positive is good.
+      ONOFF_DEF_RATING = on minus off — NEGATIVE is good (fewer points allowed).
+      ONCOURT_MIN / OFFCOURT_MIN are season TOTALS whatever per_mode says: the
+      swing is only as trustworthy as the smaller of the two samples.
+
+    The prefixes are ONCOURT/OFFCOURT rather than ON/OFF because OFF_RATING
+    already means offensive rating.
+    """
+    wanted = None if team_ids is None else {str(t) for t in team_ids}
+    chunks = []
+
+    for season in seasons:
+        refresh_this = force_refresh or should_refresh(season, season_type)
+        for team in _static_teams.get_teams():
+            if wanted is not None and str(team["id"]) not in wanted:
+                continue
+            cache_name = safe_cache_name("on_off", team["abbreviation"], season, season_type)
+
+            def fetch_raw(team_id=team["id"]):
+                frames = TeamPlayerOnOffSummary(
+                    team_id=team_id, season=season, season_type_all_star=season_type,
+                    per_mode_detailed="Totals", timeout=timeout,
+                ).get_data_frames()
+                # result sets: team overall, players OFF court, players ON court.
+                # COURT_STATUS says which is which, so stacking them loses nothing.
+                return pd.concat([f for f in frames if "VS_PLAYER_ID" in f.columns], ignore_index=True)
+
+            try:
+                raw = cached_fetch(cache_name, fetch_raw, force_refresh=refresh_this)
+            except Exception as e:
+                print(f"⚠️ On/off failed for {team['abbreviation']} {season} {season_type}: {e}")
+                raw = None
+            finally:
+                time.sleep(0.8)
+
+            if raw is None or raw.empty:
+                continue
+
+            keys = ["VS_PLAYER_ID", "VS_PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION"]
+            stats = ["NET_RATING", "OFF_RATING", "DEF_RATING", "MIN"]
+            sides = {}
+            for status, prefix in (("On", "ONCOURT_"), ("Off", "OFFCOURT_")):
+                part = raw[raw["COURT_STATUS"].astype(str).str.strip().str.lower() == status.lower()]
+                sides[status] = part[keys + stats].rename(columns={c: prefix + c for c in stats})
+            df = sides["On"].merge(sides["Off"].drop(columns=["VS_PLAYER_NAME", "TEAM_ABBREVIATION"]),
+                                   on=["VS_PLAYER_ID", "TEAM_ID"], how="outer")
+            for stat in ("NET_RATING", "OFF_RATING", "DEF_RATING"):
+                df[f"ONOFF_{stat}"] = df[f"ONCOURT_{stat}"] - df[f"OFFCOURT_{stat}"]
+
+            df = df.rename(columns={"VS_PLAYER_ID": "PLAYER_ID", "VS_PLAYER_NAME": "PLAYER_NAME"})
+            # this endpoint may write names "Last, First"; the master has "First Last"
+            df["PLAYER_NAME"] = df["PLAYER_NAME"].map(
+                lambda n: " ".join(reversed([p.strip() for p in str(n).split(",", 1)])) if "," in str(n) else n)
+            df = _normalize_names(df)
+            df["TEAM_ABBREVIATION"] = team["abbreviation"]
+            df["SEASON"] = season
+            df["SEASON_TYPE"] = season_type
+            chunks.append(df[["PLAYER_ID", "PLAYER_NAME", "TEAM_ID", "TEAM_ABBREVIATION",
+                              "SEASON", "SEASON_TYPE"] + ON_OFF_COLS])
+
+    if not chunks:
+        return pd.DataFrame()
+
+    return _consolidate(chunks, "OnOff", source="on_off")
+
+
+def add_on_off(df_master, seasons, season_types=("Regular Season", "Playoffs"),
+               timeout=120, force_refresh=False):
+    """Write the on/off columns into the master for these seasons.
+
+        df_master = add_on_off(df_master, SEASONS)                        # backfill
+        df_master = add_on_off(df_master, [ACTIVE_SEASON],                # keep current
+                               season_types=(ACTIVE_SEASON_TYPE,))
+
+    Joins on player id + team id, never on the name: this endpoint spells names
+    its own way, and a name mismatch would silently drop the player. It fills
+    rows that already exist and creates none. Only teams the master has for
+    that season are requested, so playoffs cost 16 requests, not 30.
+
+    The master carries one row per player-season under his latest team, so a
+    traded player gets his on/off with that team only.
+    """
+    indexed = isinstance(df_master.index, pd.MultiIndex)
+    m = df_master.reset_index() if indexed else df_master.copy()
+
+    def as_key(col):
+        return pd.to_numeric(col, errors="coerce").astype("Int64").astype(str)
+
+    m["_pid"], m["_tid"] = as_key(m["PLAYER_ID"]), as_key(m["TEAM_ID"])
+    for col in ON_OFF_COLS:
+        if col not in m.columns:
+            m[col] = np.nan
+
+    for season in seasons:
+        for season_type in season_types:
+            mask = (m["SEASON"] == season) & (m["SEASON_TYPE"] == season_type)
+            if not mask.any():
+                continue
+            on_off = fetch_nba_on_off([season], season_type, timeout=timeout,
+                                      force_refresh=force_refresh,
+                                      team_ids=sorted(m.loc[mask, "_tid"].unique()))
+            if on_off.empty:
+                print(f"⚠️ No on/off data for {season} {season_type}")
+                continue
+            on_off = on_off.reset_index()
+            on_off["_pid"], on_off["_tid"] = as_key(on_off["PLAYER_ID"]), as_key(on_off["TEAM_ID"])
+            lookup = on_off.drop_duplicates(["_pid", "_tid"]).set_index(["_pid", "_tid"])[ON_OFF_COLS]
+            values = lookup.reindex(pd.MultiIndex.from_frame(m.loc[mask, ["_pid", "_tid"]]))
+            m.loc[mask, ON_OFF_COLS] = values.to_numpy()
+            matched = int(values["ONCOURT_NET_RATING"].notna().sum())
+            print(f"🔁 On/off {season} {season_type}: {matched}/{int(mask.sum())} master rows filled")
+
+    m = m.drop(columns=["_pid", "_tid"])
+    return m.set_index(INDEX_COLS).sort_index() if indexed else m
+
+
 def fetch_nba_clutch_stats(
     seasons,
     season_type="Regular Season",
@@ -1065,7 +1234,7 @@ def get_player_registry(season, retries=4, timeout=30):
     for attempt in range(1, retries + 1):
         try:
             df = LeagueDashPlayerBioStats(season=season, timeout=timeout).get_data_frames()[0]
-            break                                   # ↑ no headers= — nba_api sends the x-nba-stats tokens
+            break                                   # ↑ no headers= on purpose, so NBA_STATS_HEADERS applies
         except Exception as e:
             if attempt == retries:
                 raise
@@ -1328,31 +1497,43 @@ def ingest_nba_stat(df_master, stat_type, seasons, suffix=None, season_types=("R
 
 
 
+def _normalize_index(df, index_cols=None):
+    """Put `df` on INDEX_COLS using one shared definition of row identity.
+
+    Anything that decides whether two rows are the same player-season has to
+    normalize keys identically, or a row gets patched in one place and duplicated
+    in another. sync_and_patch_stat() and ensure_active_season_rows() both come
+    through here so they can't drift apart.
+    """
+    if index_cols is None:
+        index_cols = INDEX_COLS
+
+    df = df.reset_index()
+    df = df.drop(columns=[c for c in ("index", "level_0") if c in df.columns])
+
+    if "PLAYER_NAME" in df.columns:
+        df["PLAYER_NAME"] = df["PLAYER_NAME"].apply(lambda x: unidecode(str(x)).strip())
+
+    for col in index_cols:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+
+    return (
+        df
+        .drop_duplicates(subset=index_cols, keep="first")
+        .set_index(index_cols)
+        .sort_index()
+    )
+
+
 def sync_and_patch_stat(df_master, new_data_df, index_cols=None, add_new_cols=True):
     if index_cols is None:
         index_cols = INDEX_COLS
 
     incoming_stat_cols = set(new_data_df.columns) - {'TEAM_NAME', 'NICKNAME', 'AGE'}
 
-    def normalize_df(df):
-        df = df.reset_index()
-
-        if "PLAYER_NAME" in df.columns:
-            df["PLAYER_NAME"] = df["PLAYER_NAME"].apply(lambda x: unidecode(str(x)).strip())
-
-        for col in index_cols:
-            if col in df.columns:
-                df[col] = df[col].astype(str).str.strip()
-
-        return (
-            df
-            .drop_duplicates(subset=index_cols, keep="first")
-            .set_index(index_cols)
-            .sort_index()
-        )
-
-    master = normalize_df(df_master)
-    new = normalize_df(new_data_df)
+    master = _normalize_index(df_master, index_cols)
+    new = _normalize_index(new_data_df, index_cols)
 
     if add_new_cols:
         for col in incoming_stat_cols:
@@ -1523,6 +1704,66 @@ def refresh_and_patch_custom_stat(
     
     
     
+def ensure_active_season_rows(
+    df_master,
+    active_season,
+    active_season_type,
+    per_mode="PerGame",
+    timeout=120,
+    force_refresh=True,
+):
+    """Give the active season a row for every player who has played in it.
+
+    The refresh path patches with DataFrame.update(), which writes only into rows
+    that already exist and never creates them. Anyone who wasn't in the league's
+    stat line the last time the season was built therefore stays invisible however
+    often you refresh — a late signing, someone back from injury, a call-up. The
+    same goes for a traded player: TEAM_ABBREVIATION and TEAM_ID are part of
+    INDEX_COLS, so a trade changes his key, his fresh row stops matching, and the
+    pre-trade row keeps stale numbers nothing will ever correct.
+
+    Base is the authoritative roster for a season — one row per player with at
+    least one game played — so its index is the row set the master ought to have.
+    Adding the missing rows here, before any patching, leaves every later update()
+    with somewhere to write; they arrive holding Base's columns and the remaining
+    stat families fill in the rest on their normal pass. Costs one extra Base
+    request per refresh, because should_refresh() forces the active season past
+    the cache.
+
+    Returns (df_master, added_player_names).
+    """
+    base = fetch_nba_stats(
+        "Base",
+        [active_season],
+        season_type=active_season_type,
+        per_mode=per_mode,
+        timeout=timeout,
+        force_refresh=force_refresh,
+    )
+
+    if base is None or base.empty:
+        print("⚠️ No Base data returned — skipping the missing-player check.")
+        return df_master, []
+
+    master = _normalize_index(df_master)
+    fresh = _normalize_index(base)
+
+    missing = fresh.index.difference(master.index)
+
+    if not len(missing):
+        print(f"✅ {active_season}: master already has every player.")
+        return master, []
+
+    added = fresh.loc[missing].reindex(columns=master.columns)
+    combined = pd.concat([master, added]).sort_index()
+
+    names = sorted(set(missing.get_level_values("PLAYER_NAME")))
+    print(f"➕ {active_season}: added {len(missing)} player rows the master was missing.")
+    print(f"   {', '.join(names[:8])}{' …' if len(names) > 8 else ''}")
+
+    return combined, names
+
+
 def refresh_active_season_data(
     df_master,
     active_season="2025-26",
@@ -1541,6 +1782,17 @@ def refresh_active_season_data(
     bucket_config = bucket_config or BUCKET_CONFIG
 
     before_cols = set(df_master.columns)
+
+    # update() writes only into rows that already exist, so the season needs a row
+    # for every player who has played in it *before* any patching starts.
+    df_master, _added_players = ensure_active_season_rows(
+        df_master,
+        active_season,
+        active_season_type,
+        per_mode=per_mode,
+        timeout=timeout,
+        force_refresh=force_refresh,
+    )
 
     for stat_type in full_stats:
         print(f"\n🔄 Refreshing {stat_type} — {active_season} {active_season_type}")
@@ -1595,6 +1847,7 @@ def refresh_active_season_data(
             fetch_fn=fetch_nba_stats,
             season_types=(active_season_type,),
             force_refresh=force_refresh,
+            timeout=timeout,
         )
         if bucket_df is None or bucket_df.empty:
             print(f"⚠️ No bucket data for {stat_type}")
@@ -1821,13 +2074,66 @@ def plot_top_players(
     return fig
 
 
+# Stats where a smaller number is the better one. Charts and percentiles read
+# this so that "100th percentile" always means best, whichever way the stat runs.
+LOWER_IS_BETTER = {
+    'TOV', 'TM_TOV_PCT', 'PF', 'BLKA', 'DEF_RATING',
+    'D_FG_PCT', 'PCT_PLUSMINUS', 'DEF_RIM_FG_PCT',
+    'DEF2_FG2_PCT', 'DEF3_FG3_PCT', 'DEFLT6_LT_06_PCT', 'DEFLT10_LT_10_PCT', 'DEFGT15_GT_15_PCT',
+    'DEF2_PLUSMINUS', 'DEF3_PLUSMINUS', 'DEFLT6_PLUSMINUS', 'DEFLT10_PLUSMINUS', 'DEFGT15_PLUSMINUS',
+    'OPP_PTS_OFF_TOV', 'OPP_PTS_2ND_CHANCE', 'OPP_PTS_FB', 'OPP_PTS_PAINT',
+    'DRIVE_TOV', 'DRIVE_TOV_PCT', 'ONCOURT_DEF_RATING', 'ONOFF_DEF_RATING',
+    'OPP_EFG_PCT', 'OPP_FTA_RATE', 'OPP_OREB_PCT', 'OPP_PTS',
+}
+
+
+def is_lower_better(col: str) -> bool:
+    """True for a stat where smaller is better (opponent FG% allowed, turnovers, ...)."""
+    col = str(col)
+    base = col[len('CLUTCH_'):] if col.startswith('CLUTCH_') else col
+    return (base in LOWER_IS_BETTER
+            or base.endswith('_TOV_POSS_PCT')           # play-type turnover rates
+            or base.endswith('_TOV_PER36') or base.endswith('_PF_PER36'))
+
+
 def plot_interactive_barh(
     df: pd.DataFrame, *, x_col: str, y_col: str,
     season: Optional[str] = None, season_type = 'Regular Season',query_condition: Optional[str] = None,
-    sort_by: Optional[str] = None, ascending: bool = True,
+    sort_by: Optional[str] = None, ascending: Optional[bool] = None,
     title: str = "Custom Bar Plot", ylim: Optional[Tuple[float, float]] = None,
-    cmap: str = "coolwarm", height: int = 500, width: int = 1000,
+    cmap: Optional[str] = None, height: int = 500, width: int = 1000,
+    lower_is_better: Optional[bool] = None, percentile_among: str = "shown",
+    top_n: Optional[int] = None, keep_top: Optional[dict] = None,
+    hover: Optional[list] = None,
 ) -> Any:
+    """Horizontal bar chart of one stat, best on top, with a percentile on hover.
+
+    hover: extra columns to show in the tooltip, e.g. ["TEAM_ABBREVIATION", "GP"].
+    keep_top: a volume filter by rank instead of by a fixed number,
+        {column: share kept}. keep_top={"PULL_UP_FG3A": 0.75} drops the quarter
+        of the pool that takes the fewest pull-up threes. It is applied after
+        season, season type and query_condition, so "top 75%" means of the
+        players who passed those. The cutoff it worked out is printed.
+
+    lower_is_better: None looks the stat up in LOWER_IS_BETTER (DEF_RIM_FG_PCT,
+        TM_TOV_PCT, ...). When true the smallest value is the top bar, the colour
+        map is reversed so the best value keeps the warm colour, and the
+        percentile is flipped so the best is still the 100th. Passing ascending
+        or cmap yourself overrides those two.
+    percentile_among: "shown" ranks each player among the rows that pass
+        query_condition — the qualified pool you defined. "league" ranks among
+        every player that season, which for a rate stat includes players with a
+        handful of attempts.
+    top_n: keep only the top_n bars. The percentile is still taken over the
+        whole pool, so a top-15 chart doesn't rank its players 1 to 15.
+    """
+    if lower_is_better is None:
+        lower_is_better = is_lower_better(x_col)
+    if ascending is None:
+        ascending = not lower_is_better                 # bokeh draws the last row on top
+    if cmap is None:
+        cmap = "coolwarm_r" if lower_is_better else "coolwarm"
+
     filtered = df.reset_index().copy()
 
     if season is not None:
@@ -1839,18 +2145,38 @@ def plot_interactive_barh(
     elif "season_type" in filtered.columns: # Catch case sensitivity
         filtered = filtered[filtered["season_type"] == season_type]
         
+    filtered[x_col] = pd.to_numeric(filtered[x_col], errors='coerce').astype(float)
+
+    def percentile(values):
+        # best value -> 100, whichever direction the stat runs
+        return (values.rank(pct=True, ascending=not lower_is_better) * 100).round(0)
+
+    if percentile_among == "league":
+        filtered["PERCENTILE"] = percentile(filtered[x_col])
     if query_condition:
         filtered = filtered.query(query_condition)
+    for col, share in (keep_top or {}).items():
+        if not 0 < share <= 1:
+            raise ValueError(f"keep_top[{col!r}] must be a share between 0 and 1, got {share}")
+        volume = pd.to_numeric(filtered[col], errors="coerce")
+        cutoff = volume.quantile(1 - share)
+        kept = volume >= cutoff
+        print(f"keep_top: {col} >= {cutoff:.2f} keeps {int(kept.sum())} of {len(filtered)} players")
+        filtered = filtered[kept]
+    if percentile_among != "league":
+        filtered["PERCENTILE"] = percentile(filtered[x_col])
 
     filtered = filtered.sort_values(by=sort_by or x_col, ascending=ascending)
-    filtered[x_col] = pd.to_numeric(filtered[x_col], errors='coerce').astype(float)
     filtered[y_col] = filtered[y_col].astype(str)
     filtered = filtered.dropna(subset=[x_col])
+    if top_n:
+        filtered = filtered.tail(top_n)                 # the last rows are the top bars
 
     plot = filtered.hvplot.barh(
         x=y_col, y=x_col, height=height, width=width,
         color=x_col, cmap=cmap, colorbar=True, title=title,
         xlabel=y_col, ylabel=x_col,
+        hover_cols=["PERCENTILE"] + [c for c in (hover or []) if c in filtered.columns and c not in (x_col, y_col)],
     )
     if ylim:
         plot = plot.opts(ylim=ylim)
@@ -2414,3 +2740,249 @@ def explain_player(name, season, top_n=20):
     for f, v in top.items():
         print(f"    {'+' if v>0 else '−'} {f:32s} {v*cap:>+12,.0f}")
 
+
+def prior_counts(name_key, year, decay=0.75):
+    p = picks[picks['name_key'] == name_key]
+    last3 = int(p[(p['yr'] < year) & (p['yr'] >= year - 3)]['n'].sum())
+    past  = p[p['yr'] < year]
+    # decayed career count: each past selection weighted by decay^(years_ago)
+    ever  = float((past['n'] * (decay ** (year - past['yr']))).sum())
+    return last3, ever
+
+def prior_weighted(name_key, year, decay=0.75):
+    p = aw[aw['name_key'] == name_key]
+    last3 = int(p[(p['yr'] < year) & (p['yr'] >= year - 3)]['weight'].sum())
+    past  = p[p['yr'] < year]
+    ever  = float((past['weight'] * (decay ** (year - past['yr']))).sum())
+    return ever, last3
+
+
+# =============================================================================
+# SECTION 13: LEBRON DATA RETRIEVAL
+# =============================================================================
+
+"""
+LEBRON impact-metric ingestion for the NBA salary model (v2).
+
+Loads per-season LEBRON exports (one file per season, single-season grain),
+standardizes the season format to match the salary master ('YYYY-YY'),
+concatenates them, and merges onto the model dataframe on PLAYER_ID + SEASON.
+
+Join contract:
+    LEBRON file            model master
+    ------------           ------------
+    nba_id           <->   PLAYER_ID
+    Seasons ('2020') <->   SEASON ('2019-20')   [ending-year -> hyphenated]
+"""
+\
+# Columns we keep from LEBRON. Drop Player/Team/Pos/MPG — they're either
+# redundant with the master or would collide. Keep the impact metrics + roles.
+LEBRON_VALUE_COLS = ["LEBRON", "O-LEBRON", "D-LEBRON", "WAR", "OffRole", "DefRole"]
+
+# single-season files look like 'lebron-data-2019.csv'; the multi-season
+# aggregate file (wrong grain) has multiple years and must be excluded.
+_SINGLE_SEASON_RE = re.compile(r"lebron-data-(\d{4})\.csv$")
+
+
+def _ending_year_to_season(year: int) -> str:
+    """
+    Convert a LEBRON file's year token to the NBA season string.
+
+    CONFIRMED convention: the file year is the season's ENDING year.
+      lebron-data-2026.csv -> '2025-26'   (current season)
+      lebron-data-2025.csv -> '2024-25'
+      lebron-data-2019.csv -> '2018-19'
+    """
+    start = year - 1
+    return f"{start}-{str(year)[-2:]}"
+
+
+def load_lebron_seasons(folder: str) -> pd.DataFrame:
+    """
+    Discover and load every single-season LEBRON csv in `folder`,
+    standardize the season column, and stack into one long table.
+
+    Returns a frame indexed by (PLAYER_ID, SEASON) with LEBRON_VALUE_COLS,
+    prefixed 'LBR_' so nothing collides with the master's own columns.
+    """
+    frames = []
+    found_years = []
+
+    for path in sorted(glob.glob(str(Path(folder) / "lebron-data-*.csv"))):
+        m = _SINGLE_SEASON_RE.search(Path(path).name)
+        if not m:
+            # skips the multi-season aggregate file (wrong grain) automatically
+            continue
+
+        year = int(m.group(1))
+        found_years.append(year)
+
+        df = pd.read_csv(path)  # csv module / pandas handles the quoted role fields fine
+
+        # standardize keys
+        df = df.rename(columns={"nba_id": "PLAYER_ID"})
+        df["SEASON"] = _ending_year_to_season(year)
+
+        keep = ["PLAYER_ID", "SEASON"] + [c for c in LEBRON_VALUE_COLS if c in df.columns]
+        df = df[keep]
+
+        frames.append(df)
+
+    if not frames:
+        raise FileNotFoundError(
+            f"No single-season LEBRON files found in {folder}. "
+            "Expected files named like 'lebron-data-2019.csv'."
+        )
+
+    out = pd.concat(frames, ignore_index=True)
+
+    # prefix value cols so they never clash with master columns
+    rename = {c: f"LBR_{c.replace('-', '_')}" for c in LEBRON_VALUE_COLS if c in out.columns}
+    out = out.rename(columns=rename)
+
+    # integrity: one row per player-season
+    dupes = out.duplicated(subset=["PLAYER_ID", "SEASON"]).sum()
+    if dupes:
+        print(f"⚠️  {dupes} duplicate PLAYER_ID+SEASON rows in LEBRON data — keeping first.")
+        out = out.drop_duplicates(subset=["PLAYER_ID", "SEASON"], keep="first")
+
+    print(f"✅ Loaded LEBRON for seasons: {sorted(_ending_year_to_season(y) for y in found_years)}")
+    print(f"   {len(out)} player-season rows, cols: {[c for c in out.columns if c.startswith('LBR_')]}")
+    return out
+
+
+def merge_lebron(model_df: pd.DataFrame, lebron_df: pd.DataFrame,
+                 how: str = "left") -> pd.DataFrame:
+    """
+    Merge LEBRON onto the model dataframe on PLAYER_ID + SEASON.
+
+    `model_df` may be MultiIndex'd (SEASON, SEASON_TYPE, PLAYER_NAME, PLAYER_ID, ...);
+    we reset, merge on the two shared keys, and restore the original index.
+    """
+    original_index = model_df.index.names if model_df.index.names[0] is not None else None
+    m = model_df.reset_index() if original_index else model_df.copy()
+
+    for key in ("PLAYER_ID", "SEASON"):
+        if key not in m.columns:
+            raise KeyError(f"model_df is missing join key '{key}' after reset_index().")
+
+    # normalize PLAYER_ID dtype on both sides to avoid int/str mismatch silently nulling
+    m["PLAYER_ID"] = m["PLAYER_ID"].astype(str).str.strip()
+    lebron_df = lebron_df.copy()
+    lebron_df["PLAYER_ID"] = lebron_df["PLAYER_ID"].astype(str).str.strip()
+
+    before = len(m)
+    merged = m.merge(lebron_df, on=["PLAYER_ID", "SEASON"], how=how)
+    assert len(merged) == before, "row count changed on merge — check for dup keys in LEBRON data"
+
+    # coverage report — how many model rows actually got a LEBRON match
+    lbr_cols = [c for c in lebron_df.columns if c.startswith("LBR_")]
+    if lbr_cols:
+        matched = merged[lbr_cols[0]].notna().sum()
+        print(f"🔗 LEBRON matched {matched}/{before} model rows "
+              f"({matched/before:.0%}). Unmatched are pre-2016 or sub-threshold players.")
+
+    if original_index:
+        merged = merged.set_index(list(original_index))
+    return merged
+
+
+if __name__ == "__main__":
+    import sys
+    folder = sys.argv[1] if len(sys.argv) > 1 else "."
+    lbr = load_lebron_seasons(folder)
+    print(lbr.head(10).to_string())
+
+
+# =============================================================================
+# LAG + ENCODE  (leak-safe feature construction)
+# =============================================================================
+
+LBR_NUMERIC = ["LBR_LEBRON", "LBR_O_LEBRON", "LBR_D_LEBRON", "LBR_WAR"]
+LBR_ROLES   = ["LBR_OffRole", "LBR_DefRole"]
+
+
+def _season_end_year(season: str) -> int:
+    """'2015-16' -> 2016  (ending year, as int, for consecutiveness checks)."""
+    start = int(str(season)[:4])
+    return start + 1
+
+
+def lag_and_encode_lebron(
+    model_df: pd.DataFrame,
+    numeric_lags=(1, 2),
+    role_lag: int = 1,
+    dummy_na: bool = True,
+    drop_contemporaneous: bool = True,
+):
+    """
+    Turn the merged (contemporaneous) LBR_* columns into LEAK-SAFE features:
+
+      * numeric metrics (LEBRON / O / D / WAR) -> prior-season lags, gap-masked
+      * roles (Off/Def) -> prior-season role, gap-masked, then one-hot encoded
+
+    Gap-mask: a lag of k is only kept when the prior row is EXACTLY k seasons
+    earlier (consecutive). If a player missed a season, the mispaired lag is
+    nulled instead of silently gluing a 2-years-ago value into a 'prior year' slot.
+
+    drop_contemporaneous=True removes the current-season LBR_* columns from the
+    output so they can't accidentally be used as features (current-season impact
+    predicting current-season salary is a leak).
+    """
+    idx_names = model_df.index.names if model_df.index.names[0] is not None else None
+    df = model_df.reset_index() if idx_names else model_df.copy()
+
+    for key in ("PLAYER_ID", "SEASON"):
+        if key not in df.columns:
+            raise KeyError(f"model_df missing '{key}' after reset_index().")
+
+    df["_END"] = df["SEASON"].map(_season_end_year)
+    df["PLAYER_ID"] = df["PLAYER_ID"].astype(str).str.strip()
+    df = df.sort_values(["PLAYER_ID", "_END"]).reset_index(drop=True)
+
+    g = df.groupby("PLAYER_ID", sort=False)
+    end_by_player = g["_END"]
+
+    new_cols = {}
+
+    # ---- numeric lags, gap-masked ----
+    for k in numeric_lags:
+        gap_ok = (df["_END"] - end_by_player.shift(k)) == k   # prior row is exactly k seasons back
+        for col in LBR_NUMERIC:
+            if col not in df.columns:
+                continue
+            lagged = g[col].shift(k)
+            lagged = lagged.where(gap_ok)                     # null where the season gap != k
+            new_cols[f"{col}_prior{k}"] = lagged
+
+    # ---- role lag, gap-masked, then one-hot ----
+    role_frames = []
+    gap_ok_role = (df["_END"] - end_by_player.shift(role_lag)) == role_lag
+    for col in LBR_ROLES:
+        if col not in df.columns:
+            continue
+        lagged_role = g[col].shift(role_lag).where(gap_ok_role)
+        dummies = pd.get_dummies(
+            lagged_role,
+            prefix=f"{col}_prior{role_lag}",
+            dummy_na=dummy_na,      # 'no prior-season role' becomes its own honest column
+        )
+        role_frames.append(dummies)
+
+    out = pd.concat([df, pd.DataFrame(new_cols, index=df.index)] + role_frames, axis=1)
+
+    if drop_contemporaneous:
+        drop = [c for c in LBR_NUMERIC + LBR_ROLES if c in out.columns]
+        out = out.drop(columns=drop)
+
+    out = out.drop(columns=["_END"])
+
+    n_num = len([c for c in out.columns if c.startswith("LBR_") and "_prior" in c])
+    n_role = sum(fr.shape[1] for fr in role_frames)
+    print(f"✅ Built {n_num} lagged numeric features + {n_role} lagged role one-hots.")
+    if drop_contemporaneous:
+        print("   Dropped contemporaneous LBR_* columns (leak-safe).")
+
+    if idx_names:
+        out = out.set_index(list(idx_names))
+    return out

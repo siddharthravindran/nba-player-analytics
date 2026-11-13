@@ -25,7 +25,8 @@ st.set_page_config(page_title="Market Value · NBA", page_icon="●", layout="wi
 SALARY_CAP = {'2015-16':70_000_000,'2016-17':94_143_000,'2017-18':99_093_000,
               '2018-19':101_869_000,'2019-20':109_140_000,'2020-21':109_140_000,
               '2021-22':112_414_000,'2022-23':123_655_000,'2023-24':136_021_000,
-              '2024-25':140_588_000,'2025-26':154_647_000}
+              '2024-25':140_588_000,'2025-26':154_647_000,
+              '2026-27':164_961_000}
 CAP_2526 = SALARY_CAP['2025-26']
 SEASON_DEFAULT = "2025-26"
 
@@ -111,6 +112,31 @@ def color_name(c):
 def cap_dollars(pct, season):
     return pct * SALARY_CAP.get(season, CAP_2526)
 
+def ordinal(n):
+    n = min(99, max(1, int(round(n))))                  # percentiles run 1st to 99th
+    return f"{n}{'th' if 10 <= n % 100 <= 20 else {1: 'st', 2: 'nd', 3: 'rd'}.get(n % 10, 'th')}"
+
+def stat_value(v):
+    if pd.isna(v):
+        return "—"
+    return f"{v:,.3f}" if abs(v) < 1 else f"{v:,.1f}"
+
+def stat_context(frame):
+    """Per factor: the player's own value, and where it ranks among that season's players.
+
+    The percentile comes from a feat_pctile column written by the export cell
+    (0–1, ranked within season over every player the model saw). An export
+    without that column still shows the value.
+    """
+    has_pct = "feat_pctile" in frame.columns
+    out = []
+    for i in range(len(frame)):
+        text = f"value {stat_value(frame['feat_value'].iloc[i])}"
+        if has_pct and pd.notna(frame["feat_pctile"].iloc[i]):
+            text += f" · {ordinal(frame['feat_pctile'].iloc[i] * 100)} percentile that season"
+        out.append(text)
+    return out
+
 
 def render_player_view(meta, shap, highlight_impact=False):
     """Shared per-player view. If highlight_impact, LEBRON bars are drawn in violet."""
@@ -188,7 +214,8 @@ def render_player_view(meta, shap, highlight_impact=False):
     fig = go.Figure(go.Bar(
         x=psh["shap_usd"], y=[nice_feature(f) for f in psh["feature"]], orientation="h",
         marker_color=bar_colors,
-        customdata=[("raises" if v > 0 else "lowers") + f" price by {money(abs(v))}" for v in psh["shap_usd"]],
+        customdata=[("raises" if v > 0 else "lowers") + f" price by {money(abs(v))}<br>{ctx}"
+                    for v, ctx in zip(psh["shap_usd"], stat_context(psh))],
         hovertemplate="%{y}<br>%{customdata}<extra></extra>"))
     fig.add_vline(x=0, line_width=1.5, line_color=MUTE)
     fig.update_layout(
@@ -212,7 +239,10 @@ def render_player_view(meta, shap, highlight_impact=False):
         allf = shap[(shap["PLAYER_NAME"] == player) & (shap["SEASON"] == season)].copy()
         allf = allf.reindex(allf["shap_usd"].abs().sort_values(ascending=False).index)
         tbl = pd.DataFrame({"Factor": [nice_feature(f) for f in allf["feature"]],
-                            "Effect on price": [money(v) for v in allf["shap_usd"]]})
+                            "Effect on price": [money(v) for v in allf["shap_usd"]],
+                            "Value": [stat_value(v) for v in allf["feat_value"]]})
+        if "feat_pctile" in allf.columns:
+            tbl["Percentile"] = [ordinal(p * 100) if pd.notna(p) else "—" for p in allf["feat_pctile"]]
         st.dataframe(tbl, use_container_width=True, hide_index=True, height=320)
 
 
