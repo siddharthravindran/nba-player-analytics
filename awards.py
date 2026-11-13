@@ -11,6 +11,8 @@
     predict_allstars(voters, df_master, model)             # 12 a conference plus the next five, same voting model
     pick_all_defense(model, df_master)                     # All-Defensive teams, from a second model trained on that vote
     fit_alldefense_model(df_master, model).weights         # what All-Defensive voters reward
+    mip = fit_mip_model(df_master, model)                  # Most Improved: trained on who finished top five in that vote
+    predict_mip(mip, df_master, model)                     # this season's candidates, with what changed
 
 player_ranking answers "who has played best". This answers a different
 question: given how voters have behaved since 2015-16, who gets a spot. The two
@@ -55,6 +57,16 @@ LABELS.update({"DEFLECTIONS": "deflections", "CONTESTED_SHOTS": "shots contested
                "D_FG_PCT": "opponent FG%", "DEF_RIM_FGA": "rim shots defended", "DEF_RIM_FG_PCT": "opponent FG% at the rim",
                "DEF_RATING": "team defense with him on", "ONOFF_DEF_RATING": "defense on vs off court",
                "DEF_WS": "defensive win shares", "BBR_DBPM": "defensive BPM", "D_RATING": "defensive impact rating"})
+# Most Improved is about change, so its inputs are this season minus last (UP_...), plus who voters pass over:
+# established stars (PRIOR_NBA), older players, and second-year players, whose jump is expected.
+MIP_STATS = ["UP_PTS", "UP_MIN", "UP_AST", "UP_REB", "UP_TS_PCT", "UP_USG_PCT", "UP_PIE", "UP_RATING", "UP_WINS_PACE", "UP_W_PCT",
+             "PTS", "MIN", "W_PCT", "GP_SHARE", "BBR_AGE", "SOPHOMORE", "PRIOR_NBA", "PRIOR"]
+_CHANGES = ["PTS", "MIN", "AST", "REB", "TS_PCT", "USG_PCT", "PIE", "RATING", "WINS_PACE", "W_PCT"]
+LABELS.update({"UP_PTS": "scoring jump", "UP_MIN": "more minutes", "UP_AST": "more assists", "UP_REB": "more rebounds",
+               "UP_TS_PCT": "better efficiency", "UP_USG_PCT": "bigger role", "UP_PIE": "more all-round production",
+               "UP_RATING": "better impact rating", "UP_WINS_PACE": "more wins added", "UP_W_PCT": "team improved",
+               "BBR_AGE": "age", "SOPHOMORE": "second-year player", "PRIOR_NBA": "already an All-NBA player"})
+MIP_POOL_MIN, MIP_PREV_GP = 20.0, 20         # needs a real previous season to improve on
 POOL_MIN, POOL_GP_SHARE = 24.0, 0.45         # every All-NBA player since 2015-16 clears both
 DEFENSE_POOL_MIN = 20.0                      # All-Defensive specialists play less
 GAMES_RULE_FROM, GAMES_RULE, SEASON_GAMES = "2023-24", 65, 82
@@ -66,7 +78,8 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense"]
+__all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+           "fit_mip_model", "predict_mip"]
 
 
 @dataclass
@@ -103,9 +116,37 @@ def _alldefense_selections(refresh=False):
     return long[["name_key", "yr", "weight"]]
 
 
+def _mip_selections(refresh=False):
+    """Top five in each season's Most Improved Player vote (Basketball-Reference): name_key, yr, weight, finish."""
+    cache = DATA_DIR / "mip_voting.parquet"
+    if cache.exists() and not refresh:
+        raw = pd.read_parquet(cache)
+    else:
+        from io import StringIO
+        frames = []
+        for year in range(2017, int(max(SEASONS)[:4]) + 1):
+            html = _get(f"https://www.basketball-reference.com/awards/awards_{year}.html")
+            at = html.find('id="mip"')
+            if at < 0:
+                continue                                                    # not voted on yet
+            t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+            t.columns = [c[-1] if isinstance(c, tuple) else c for c in t.columns]
+            t = t[["Rank", "Player", "Age", "Tm", "First", "Pts Won", "Pts Max", "Share"]].copy()
+            t.insert(0, "SEASON", f"{year - 1}-{str(year)[2:]}")
+            frames.append(t)
+        raw = pd.concat(frames, ignore_index=True)
+        raw = raw.astype(object).where(raw.notna(), None).astype("string")
+        raw.to_parquet(cache)
+    raw = raw.assign(finish=raw.groupby("SEASON").cumcount() + 1)           # the page lists most votes first
+    top = raw[raw["finish"] <= 5]
+    return pd.DataFrame({"name_key": top["Player"].map(norm_name), "yr": top["SEASON"].str[:4].astype(int),
+                         "weight": 1, "finish": top["finish"]})
+
+
 _AWARDS = {   # award -> (selections, stats, minimum minutes, team labels)
     "nba": (_allnba_selections, VOTER_STATS, POOL_MIN, TEAM_NAMES),
     "defense": (_alldefense_selections, DEFENSE_STATS, DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
+    "mip": (_mip_selections, MIP_STATS, MIP_POOL_MIN, {1: "top 5"}),
 }
 
 
@@ -126,8 +167,19 @@ def _voter_table(df_master, rating_model, award="nba"):
         one["GP_SHARE"] = (one["GP"] / played).clip(upper=1.0)
         parts.append(one.reset_index())
     table = pd.concat(parts, ignore_index=True)
+    table = table.sort_values("GP").drop_duplicates(["PLAYER_ID", "SEASON"], keep="last").sort_index().reset_index(drop=True)
     table["name_key"] = table["PLAYER_NAME"].map(norm_name)
     table["yr"] = table["SEASON"].str[:4].astype(int)
+
+    # this season against last: UP_PTS and so on, and whether last season was his first
+    last = table[["PLAYER_ID", "yr", "GP"] + _CHANGES].apply(lambda c: pd.to_numeric(c, errors="coerce") if c.name != "PLAYER_ID" else c)
+    last = last.assign(yr=last["yr"] + 1).rename(columns={c: f"PREV_{c}" for c in ["GP"] + _CHANGES})
+    table = table.merge(last, on=["PLAYER_ID", "yr"], how="left")
+    for c in _CHANGES:
+        table[f"UP_{c}"] = pd.to_numeric(table[c], errors="coerce") - table[f"PREV_{c}"]
+    debut = table.groupby("PLAYER_ID")["yr"].transform("min")
+    first_data_year = table["yr"].min()                    # everyone "debuts" in the first season of the data
+    table["SOPHOMORE"] = ((debut == table["yr"] - 1) & (debut > first_data_year)).astype(float)
 
     picks = selections()
     made = picks.set_index(["name_key", "yr"])["weight"]
@@ -140,6 +192,13 @@ def _voter_table(df_master, rating_model, award="nba"):
         g = by_player.get(key)
         prior.append(0 if g is None else g.loc[(g["yr"] < year) & (g["yr"] >= year - 3), "weight"].sum())
     table["PRIOR"] = prior
+    if award == "mip":
+        stars = {k: g for k, g in _allnba_selections().groupby("name_key")}
+        table["PRIOR_NBA"] = [0 if stars.get(k) is None else stars[k].loc[stars[k]["yr"] < y, "weight"].sum()
+                              for k, y in zip(table["name_key"], table["yr"])]
+        if "finish" in picks.columns:
+            table["FINISH"] = [picks.set_index(["name_key", "yr"])["finish"].get(k, np.nan) for k in zip(table["name_key"], table["yr"])]
+        table = table[table["PREV_GP"] >= MIP_PREV_GP]
 
     pool = table[(table["MIN"] >= pool_min) & (table["GP_SHARE"] >= POOL_GP_SHARE)].copy()
     left_out = table[(table["VOTES"] > 0) & ~table.index.isin(pool.index)]
@@ -193,6 +252,21 @@ def fit_alldefense_model(df_master, rating_model, penalty=None, verbose=True):
                       "by steals plus blocks {BY_STOCKS}")
 
 
+def fit_mip_model(df_master, rating_model, penalty=None, verbose=True):
+    """Train the Most Improved Player model on who finished in the top five of that vote, 2016-17 on.
+
+    Its inputs are changes from the previous season (scoring, minutes, role,
+    efficiency, impact) plus the things that make voters look elsewhere: age,
+    being in a second season, and having already made an All-NBA team. Players
+    without 20 games the season before are left out, which removes rookies.
+    Five spots a season is very little to learn from — read .check.
+    """
+    return _fit_votes(df_master, rating_model, "mip", penalty, verbose, "Most Improved Player",
+                      {"BY_SCORING_JUMP": "UP_PTS", "BY_RATING_JUMP": "UP_RATING", "BY_MINUTES_JUMP": "UP_MIN"},
+                      "the five biggest scoring jumps get {BY_SCORING_JUMP}, impact-rating jumps {BY_RATING_JUMP}, "
+                      "minutes jumps {BY_MINUTES_JUMP}")
+
+
 def _fit_votes(df_master, rating_model, award, penalty, verbose, title, yardsticks, yardstick_text):
     stats, names = _AWARDS[award][1], _AWARDS[award][3]
     spots = 5 * len(names)
@@ -242,8 +316,9 @@ def _fit_votes(df_master, rating_model, award, penalty, verbose, title, yardstic
         n, right = len(seasons) * spots, check[f"RIGHT_OF_{spots}"]
         print(f"\n{title} voting model: {int(y[known].sum())} selections over {len(seasons)} seasons, "
               f"{int(known.sum())} player-seasons, penalty C={penalty:g}")
+        first = f", first team {check['FIRST_TEAM_OF_5'].sum()} of {len(seasons) * 5}" if "1st" in names.values() else ""
         print(f"Each season predicted without seeing it: {right.sum()} of {n} spots right "
-              f"({right.mean():.1f} of {spots} a season), first team {check['FIRST_TEAM_OF_5'].sum()} of {len(seasons) * 5}")
+              f"({right.mean():.1f} of {spots} a season){first}")
         print("  for comparison, " + yardstick_text.format(**{k: check[k].sum() for k in yardsticks}))
         print("What voters reward most: " + ", ".join(f"{LABELS[k]} ({v:+.2f})" for k, v in weights.head(6).items()))
     return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, pd.DataFrame(missed), award)
@@ -371,4 +446,42 @@ def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=N
     out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out))
+    return out.head(top) if top else out
+
+
+def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, strict=True):
+    """Most Improved Player candidates for a season, most likely first.
+
+    strict=True leaves out the players voters almost never choose however big
+    the jump: second-year players (none of the ten winners since 2016-17, though
+    9 of the 50 top-five finishers) and anyone who has already made an All-NBA
+    team (1 of 50). The model already marks both down; strict removes them.
+    strict=False shows everyone, with the reason in WHY_NOT.
+
+    CHANCE     probability of finishing in the top five of the vote
+    PTS_WAS / MIN_WAS / RATING_WAS   last season's numbers next to this season's
+    SOPHOMORE  True for second-year players, who rarely win
+    FINISH     where he actually finished, for seasons already voted on
+    WHY / WHY_NOT  what is pushing his chance up and down the most
+
+    Only players with 20+ games last season are candidates, so no rookies, and
+    the 65-game rule applies. Early in a season the changes are this season's
+    first weeks against all of last season, so hot starts are overrated.
+    """
+    pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
+    out = pd.DataFrame({
+        "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "AGE": pool["BBR_AGE"], "GP": pool["GP"].astype(int),
+        "CHANCE": chance, "PTS": pool["PTS"], "PTS_WAS": pool["PREV_PTS"], "MIN": pool["MIN"], "MIN_WAS": pool["PREV_MIN"],
+        "RATING": pool["RATING"], "RATING_WAS": pool["PREV_RATING"], "SOPHOMORE": pool["SOPHOMORE"] == 1,
+        "ALL_NBA_BEFORE": pool["PRIOR_NBA"] > 0, "CAN_REACH_65": _can_reach(pool),
+        "WHY": [_reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [_reasons(r, -1) for _, r in pull.iterrows()],
+    })
+    if pool["DECIDED"].any() and "FINISH" in pool.columns:
+        out.insert(5, "FINISH", pool["FINISH"])
+    out = out[out["CAN_REACH_65"]]
+    if strict:
+        out = out[~out["SOPHOMORE"] & ~out["ALL_NBA_BEFORE"]]
+    out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
+    out.insert(0, "RANK", np.arange(1, len(out) + 1))
+    out.attrs.update(season=season, n=len(out), strict=strict)
     return out.head(top) if top else out
