@@ -8,6 +8,8 @@
     predict_allnba(voters, df_master, model, "2023-24")    # a past season, next to what really happened
     voters.weights                                         # what voters reward, largest first
     voters.check                                           # one row per season: hits out of 15
+    predict_allstars(voters, df_master, model)             # 12 a conference plus the next five, same voting model
+    pick_all_defense(model, df_master)                     # two teams of five by defensive impact (not a voting model)
 
 player_ranking answers "who has played best". This answers a different
 question: given how voters have behaved since 2015-16, who gets a spot. The two
@@ -50,6 +52,9 @@ GAMES_RULE_FROM, GAMES_RULE, SEASON_GAMES = "2023-24", 65, 82
 GAMES_SLACK = 1
 PENALTIES = (0.01, 0.03, 0.1, 0.3, 1.0)
 TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
+EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
+
+__all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "pick_all_defense"]
 
 
 @dataclass
@@ -180,6 +185,23 @@ def fit_allnba_model(df_master, rating_model, penalty=None, verbose=True):
     return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, pd.DataFrame(missed))
 
 
+def _voter_scores(voters, df_master, rating_model, season):
+    """One season's rotation players, each stat's pull on the vote, and the chance of an All-NBA spot."""
+    pool, Z = _voter_table(df_master, rating_model)
+    here = (pool["SEASON"] == season).to_numpy()
+    if not here.any():
+        raise ValueError(f"no rotation players for {season}")
+    pool, Z = pool[here], Z[here]
+    pull = Z * voters.weights.reindex(VOTER_STATS)
+    chance = pd.Series(1 / (1 + np.exp(-(pull.sum(axis=1) + voters.intercept))), index=pool.index)
+    return pool, pull, chance
+
+
+def _reasons(row, sign):
+    picked = (row * sign).nlargest(2)
+    return ", ".join(LABELS[k] for k, v in picked.items() if v > 0.15)
+
+
 def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     """Each player's chance of an All-NBA spot for a season, best first, with the projected teams.
 
@@ -194,19 +216,9 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     far, so this is "if the vote were today on today's pace". It can't know
     about games he is going to miss.
     """
-    pool, Z = _voter_table(df_master, rating_model)
-    here = (pool["SEASON"] == season).to_numpy()
-    if not here.any():
-        raise ValueError(f"no rotation players for {season}")
-    pool, Z = pool[here], Z[here]
-    w = voters.weights.reindex(VOTER_STATS)
-    pull = Z * w
-    chance = pd.Series(1 / (1 + np.exp(-(pull.sum(axis=1) + voters.intercept))), index=pool.index)
+    pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
     eligible = _can_reach(pool)
-
-    def reasons(row, sign):
-        picked = (row * sign).nlargest(2)
-        return ", ".join(LABELS[k] for k, v in picked.items() if v > 0.15)
+    reasons = _reasons
 
     out = pd.DataFrame({
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
@@ -218,6 +230,83 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     if pool["DECIDED"].any():
         out.insert(8, "ACTUAL", pool["VOTES"].map(TEAM_NAMES).fillna(""))
     out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
+    out.insert(0, "RANK", np.arange(1, len(out) + 1))
+    out.attrs.update(season=season, n=len(out))
+    return out.head(top) if top else out
+
+
+def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12, next_up=5):
+    """All-Stars by conference: the `spots` players voters would rate highest, then the next few in line.
+
+    SPOT     "starter" for a conference's top five, "reserve" for the rest of the 12, "next" for the replacements
+    SCORE    the voting model's score (higher is better); it keeps separating players after CHANCE has hit zero
+    CHANCE   his chance of an All-NBA spot, for scale
+    RATING_RANK  where the impact model has him in his conference, for contrast
+
+    This borrows the All-NBA voting model — there is no All-Star voting history
+    in the data to train on. The two honours reward the same things (scoring,
+    winning, playing), but All-Star starters are half fan vote, and popularity
+    is not something the data sees. Positions are ignored, and there is no
+    65-game rule: the vote happens in January.
+    """
+    pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
+    out = pd.DataFrame({
+        "CONF": np.where(pool["TEAM_ABBREVIATION"].isin(EAST), "East", "West"),
+        "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
+        "PTS": pool["PTS"], "W_PCT": pool["W_PCT"], "SCORE": pull.sum(axis=1) + voters.intercept, "CHANCE": chance,
+        "RATING": pool["RATING"], "WHY": [_reasons(r, 1) for _, r in pull.iterrows()],
+    })
+    out["RATING_RANK"] = out.groupby("CONF")["RATING"].rank(ascending=False).astype(int)
+    out = out.sort_values(["CONF", "SCORE"], ascending=[True, False])
+    out["RANK"] = out.groupby("CONF").cumcount() + 1
+    out = out[out["RANK"] <= spots + next_up].copy()
+    out["SPOT"] = np.select([out["RANK"] <= 5, out["RANK"] <= spots], ["starter", "reserve"], default="next")
+    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", "PTS", "W_PCT", "SCORE", "CHANCE", "RATING_RANK", "WHY"]
+    out = out[cols].reset_index(drop=True)
+    out.attrs.update(season=season)
+    return out
+
+
+def pick_all_defense(rating_model, df_master, season="2026-27", top=20):
+    """All-Defensive teams by defensive impact: the ten best eligible defenders, five to a team.
+
+    DEF_SCORE  the average of two opinions, each measured against the pool: this model's
+               D_RATING and Basketball-Reference's defensive BPM (when the master has it)
+    TEAM       1st / 2nd for the ten highest eligible scores
+    The rest are context: steals, blocks and deflections per game, how far below
+    their usual percentage opponents shoot against him (OPP_FG_DIFF, negative is
+    good), and what they shoot at the rim.
+
+    This is NOT a voting model — the data has no All-Defensive history to learn
+    from, so it says who has defended best by the numbers, not who voters will
+    name. Voters lean on reputation and on team defense; this doesn't. Same pool
+    as the other awards (24+ minutes, about half his team's games) and the same
+    65-game rule.
+    """
+    pool, _ = _voter_table(df_master, rating_model)
+    pool = pool[pool["SEASON"] == season].copy()
+    if pool.empty:
+        raise ValueError(f"no rotation players for {season}")
+    rated = rank_players(rating_model, df_master, season, min_min=0, min_gp=0).set_index("PLAYER_ID")
+    pool["D_RATING"] = pool["PLAYER_ID"].map(rated["D_RATING"])
+    z = lambda s: (s - s.mean()) / s.std()
+    views = [z(pool["D_RATING"])]
+    if "BBR_DBPM" in pool.columns and pool["BBR_DBPM"].notna().mean() > 0.5:
+        views.append(z(pd.to_numeric(pool["BBR_DBPM"], errors="coerce")))
+    pool["DEF_SCORE"] = pd.concat(views, axis=1).mean(axis=1)
+    eligible = _can_reach(pool)
+    order = pool.loc[eligible, "DEF_SCORE"].sort_values(ascending=False).index[:10]
+    team = pd.Series("", index=pool.index)
+    team[order[:5]], team[order[5:]] = "1st", "2nd"
+
+    get = lambda c: pd.to_numeric(pool[c], errors="coerce") if c in pool.columns else np.nan
+    out = pd.DataFrame({
+        "Player": pool["PLAYER_NAME"], "TEAM_ABBR": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int), "MIN": pool["MIN"],
+        "TEAM": team, "DEF_SCORE": pool["DEF_SCORE"], "D_RATING": pool["D_RATING"], "DBPM": get("BBR_DBPM"),
+        "STL": get("STL"), "BLK": get("BLK"), "DEFLECTIONS": get("DEFLECTIONS"),
+        "OPP_FG_DIFF": get("PCT_PLUSMINUS"), "RIM_FG_PCT": get("DEF_RIM_FG_PCT"), "CAN_REACH_65": eligible,
+    })
+    out = out.sort_values("DEF_SCORE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out))
     return out.head(top) if top else out
