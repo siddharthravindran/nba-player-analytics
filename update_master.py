@@ -66,10 +66,36 @@ def refresh_bbref(df_master, advanced=None):
         return df_master
 
 
-def problems(before, after):
-    """Reasons not to save. An empty list means the refreshed master is safe to write."""
+def drop_stale_team_rows(df_master):
+    """Remove the row a player leaves behind when he changes teams mid-season.
+
+    The master is indexed by team, and a season row carries the player's totals
+    under his latest team. After a trade the refresh adds a row for the new team
+    but the old team's row stays, frozen at the day he left. Of a player's rows
+    for the active season, keep the one with the most games (then the fullest).
+    Returns the cleaned master and the number of rows removed.
+    """
+    flat = df_master.reset_index()
+    active = (flat["SEASON"] == ACTIVE_SEASON) & (flat["SEASON_TYPE"] == ACTIVE_SEASON_TYPE)
+    rows = flat[active].assign(_gp=pd.to_numeric(flat.loc[active, "GP"], errors="coerce").fillna(-1),
+                               _filled=flat[active].notna().sum(axis=1))
+    keep = rows.sort_values(["_gp", "_filled"]).drop_duplicates("PLAYER_ID", keep="last").index
+    stale = rows.index.difference(keep)
+    if len(stale):
+        gone = flat.loc[stale]
+        print(f"🧹 removed {len(stale)} stale rows left by team changes: "
+              + ", ".join(f"{n} ({t})" for n, t in zip(gone["PLAYER_NAME"], gone["TEAM_ABBREVIATION"])))
+        flat = flat.drop(index=stale)
+    return flat.set_index(list(df_master.index.names)).sort_index(), len(stale)
+
+
+def problems(before, after, removed=0):
+    """Reasons not to save. An empty list means the refreshed master is safe to write.
+
+    removed: stale rows dropped on purpose by drop_stale_team_rows, which don't count as lost.
+    """
     found = []
-    if len(after) < len(before):
+    if len(after) + removed < len(before):
         found.append(f"rows went down: {len(before):,} -> {len(after):,}")
     lost = sorted(set(before.columns) - set(after.columns))
     if lost:
@@ -142,9 +168,9 @@ def main():
     print(f"\n===== {pd.Timestamp.now(tz='America/Los_Angeles'):%Y-%m-%d %H:%M %Z} — "
           f"refreshing {ACTIVE_SEASON} {ACTIVE_SEASON_TYPE} =====")
     before = pd.read_parquet(MASTER).set_index(INDEX_COLS).sort_index()
-    after = refresh(before.copy())
+    after, removed = drop_stale_team_rows(refresh(before.copy()))
 
-    found = problems(before, after)
+    found = problems(before, after, removed)
     if found:
         print("❌ NOT SAVED — the refreshed master failed its checks:")
         for line in found:
