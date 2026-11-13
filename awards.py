@@ -73,6 +73,12 @@ GAMES_RULE_FROM, GAMES_RULE, SEASON_GAMES = "2023-24", 65, 82
 # The league's count is not always the stat sheet's: in 2025-26 three First Team players show 64 games here
 # (two won "extraordinary circumstances" appeals). One game of slack keeps the filter from ruling out real picks.
 GAMES_SLACK = 1
+# A season in progress is scored on the line each player is headed for, not the dozen games he has (_project_season).
+# His numbers so far are weighed against this many games of his last season. 25 is a judgment, not a fitted value.
+EARLY_PRIOR_GAMES = 25
+EARLY_PRIOR_MIN_GP = 20                      # a "last season" shorter than this is skipped for the one before
+_TEAM_STATS = ["W_PCT", "DEF_RATING", "ONOFF_DEF_RATING"]         # say little about him once he has changed teams
+_NOT_PROJECTED = ["PRIOR", "PRIOR_NBA", "SOPHOMORE", "BBR_AGE"]   # facts about him, not this season's play
 PENALTIES = (0.01, 0.03, 0.1, 0.3, 1.0)
 TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
@@ -154,7 +160,7 @@ def _voter_table(df_master, rating_model, award="nba"):
     """One row per rotation player per season with the stats voters see, and what the voters did."""
     selections, stats, pool_min, _ = _AWARDS[award]
     df = _regular_season(df_master)
-    parts = []
+    parts, in_progress = [], None
     for season in sorted(df["SEASON"].unique()):
         rated = rank_players(rating_model, df_master, season, min_min=0, min_gp=0).set_index("PLAYER_ID")
         one = df[df["SEASON"] == season].set_index("PLAYER_ID")
@@ -163,6 +169,7 @@ def _voter_table(df_master, rating_model, award="nba"):
         most = min(one["GP"].max(), SEASON_GAMES)             # a traded player can appear in 83 or 84
         # a finished season is judged against the league's schedule; one in progress against his own team's
         played = team_games if most < 0.9 * SEASON_GAMES and season == df["SEASON"].max() else most
+        in_progress = season if isinstance(played, pd.Series) else in_progress
         one["TEAM_GAMES"] = team_games if isinstance(played, pd.Series) else most
         one["GP_SHARE"] = (one["GP"] / played).clip(upper=1.0)
         parts.append(one.reset_index())
@@ -209,7 +216,96 @@ def _voter_table(df_master, rating_model, award="nba"):
     X = pool[stats].apply(pd.to_numeric, errors="coerce").astype(float)
     by_season = X.groupby(pool["SEASON"])
     Z = ((X - by_season.transform("mean")) / by_season.transform("std").replace(0, np.nan)).clip(-5, 5).fillna(0)
+    if in_progress and (pool["SEASON"] == in_progress).any():
+        # Most Improved is about how far he has moved from last season, so pulling him back toward it would
+        # erase what is being measured (tried: nobody clears 3%). There only the games are projected.
+        Z = _project_season(table, pool, X, Z, in_progress, stats_too=award != "mip")
     return pool, Z
+
+
+def _project_season(table, pool, X, Z, season, stats_too=True):
+    """Score a season in progress on where each player is headed, not on the games so far.
+
+    Twelve games are noisy, and the vote is on 82. Each stat is pulled toward
+    the player's own last season (the one before, if he barely played), by how
+    much of the season is left: about 40% this season's numbers after 12 games,
+    80% at the halfway mark, all of it by the end. A player with no last season
+    is pulled toward the average rotation player. Team stats are pulled toward
+    average if he has changed teams. The UP_ changes are pulled toward "no change".
+
+    Games played is projected too: the games he has, plus the rest of the
+    schedule at the rate players with his last season have gone on to play
+    (_games_rate). Otherwise four missed games in November count like missing
+    a third of a season.
+
+    Only the scoring changes. The stats shown in the tables stay the real ones.
+    stats_too=False projects the games and leaves the stats as they are.
+    """
+    here = (pool["SEASON"] == season).to_numpy()
+    cur, stats, year = pool[here], list(Z.columns), int(season[:4])
+    by_season = X.groupby(pool["SEASON"])
+    mean, spread = by_season.mean(), by_season.std().replace(0, np.nan)
+    ups = [c for c in stats if c.startswith("UP_")]
+    levels = [c for c in stats if c in table.columns and c not in ups + _NOT_PROJECTED + ["GP_SHARE"]]
+
+    prior = None                                           # each player's last real season, in that season's z-scores
+    for back in (1, 2):
+        then = table[(table["yr"] == year - back) & (table["GP"] >= EARLY_PRIOR_MIN_GP)].set_index("PLAYER_ID")
+        if then.empty or then["SEASON"].iloc[0] not in mean.index:
+            continue
+        s = then["SEASON"].iloc[0]
+        z = ((then[levels].apply(pd.to_numeric, errors="coerce") - mean.loc[s, levels]) / spread.loc[s, levels]).clip(-5, 5)
+        z = z.assign(_TEAM=then["TEAM_ABBREVIATION"])
+        prior = z if prior is None else prior.combine_first(z)
+    if prior is None:
+        return Z
+    prior = prior.reindex(cur["PLAYER_ID"].to_numpy())
+    prior.index = cur.index
+
+    target = pd.DataFrame(0.0, index=cur.index, columns=stats)
+    target[levels] = prior[levels].astype(float).fillna(0.0)
+    moved = (prior["_TEAM"] != cur["TEAM_ABBREVIATION"]).to_numpy()
+    target.loc[moved, [c for c in _TEAM_STATS if c in levels]] = 0.0
+    for c in ups:
+        target[c] = -mean.loc[season, c] / spread.loc[season, c]             # "no change from last season"
+
+    games = cur["GP"].astype(float)
+    left = (SEASON_GAMES - cur["TEAM_GAMES"]).clip(lower=0).astype(float)
+    rest = games / (games + EARLY_PRIOR_GAMES)             # how far to trust his numbers for the games still to come
+    now = ((games + left * rest) / (games + left)).to_numpy()[:, None] if stats_too else 1.0
+    projected = Z[here] * now + target.fillna(0.0) * (1 - now)
+    fixed = [c for c in _NOT_PROJECTED if c in stats]
+    projected[fixed] = Z.loc[cur.index, fixed]
+
+    if "GP_SHARE" in stats:
+        past = pool.loc[~here].groupby("SEASON")["GP_SHARE"]
+        usual, usual_spread = past.mean().mean(), past.std().mean()
+        before = table[table["yr"] < year].groupby("PLAYER_ID")["yr"].min()          # rookies have no entry
+        was = table[table["yr"] == year - 1].set_index("PLAYER_ID")["GP_SHARE"]
+        was = pd.Series(cur["PLAYER_ID"].map(was).to_numpy(), index=cur.index)
+        was = was.where(was.notna() | ~cur["PLAYER_ID"].isin(before.index), 0.0)     # a veteran who sat out all of last season
+        base, slope = _games_rate(table, season)
+        rate = (base + slope * was).fillna(usual).clip(0.0, 1.0)
+        share = ((games + left * rate) / (cur["TEAM_GAMES"] + left)).clip(upper=1.0)
+        projected["GP_SHARE"] = ((share - usual) / usual_spread).clip(-5, 5)
+
+    Z = Z.copy()
+    Z.loc[cur.index] = projected[stats]
+    return Z
+
+
+def _games_rate(table, season, min_min=20.0):
+    """Share of games a rotation player goes on to play, from the share he played the season before.
+
+    A straight-line fit on every finished season. One injured season is only
+    partly repeated: the slope is well under 1.
+    """
+    done = table[table["SEASON"] < season]
+    was = done[["PLAYER_ID", "yr", "GP_SHARE", "MIN"]].assign(yr=done["yr"] + 1).rename(columns={"GP_SHARE": "WAS", "MIN": "MIN_WAS"})
+    both = done.merge(was, on=["PLAYER_ID", "yr"])
+    both = both[both["MIN_WAS"] >= min_min]
+    slope, base = np.polyfit(both["WAS"].astype(float), both["GP_SHARE"].astype(float), 1)
+    return base, slope
 
 
 def _can_reach(pool):
@@ -351,9 +447,10 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     WHY / WHY_NOT  the stats pushing his chance up and down the most
     RATING_RANK   where the impact model has him in the same pool, for contrast
 
-    During a season the inputs are per-game numbers and his team's record so
-    far, so this is "if the vote were today on today's pace". It can't know
-    about games he is going to miss.
+    During a season this is a projection of the final vote: his numbers so far
+    are pulled toward his last season by how much of the schedule is left
+    (_project_season), and his games are projected at last season's rate.
+    It can't know about injuries still to come.
     """
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
     eligible = _can_reach(pool)
