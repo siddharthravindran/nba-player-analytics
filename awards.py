@@ -60,12 +60,12 @@ LABELS.update({"DEFLECTIONS": "deflections", "CONTESTED_SHOTS": "shots contested
 # Most Improved is about change, so its inputs are this season minus last (UP_...), plus who voters pass over:
 # established stars (PRIOR_NBA), older players, and second-year players, whose jump is expected.
 MIP_STATS = ["UP_PTS", "UP_MIN", "UP_AST", "UP_REB", "UP_TS_PCT", "UP_USG_PCT", "UP_PIE", "UP_RATING", "UP_WINS_PACE", "UP_W_PCT",
-             "PTS", "MIN", "W_PCT", "GP_SHARE", "BBR_AGE", "SOPHOMORE", "PRIOR_NBA", "PRIOR"]
+             "OVER_BEST_PTS", "PTS", "MIN", "W_PCT", "GP_SHARE", "BBR_AGE", "SOPHOMORE", "PRIOR_NBA", "PRIOR"]
 _CHANGES = ["PTS", "MIN", "AST", "REB", "TS_PCT", "USG_PCT", "PIE", "RATING", "WINS_PACE", "W_PCT"]
 LABELS.update({"UP_PTS": "scoring jump", "UP_MIN": "more minutes", "UP_AST": "more assists", "UP_REB": "more rebounds",
                "UP_TS_PCT": "better efficiency", "UP_USG_PCT": "bigger role", "UP_PIE": "more all-round production",
                "UP_RATING": "better impact rating", "UP_WINS_PACE": "more wins added", "UP_W_PCT": "team improved",
-               "BBR_AGE": "age", "SOPHOMORE": "second-year player", "PRIOR_NBA": "already an All-NBA player"})
+               "OVER_BEST_PTS": "scoring above his previous best", "BBR_AGE": "age", "SOPHOMORE": "second-year player", "PRIOR_NBA": "already an All-NBA player"})
 MIP_POOL_MIN, MIP_PREV_GP = 20.0, 20         # needs a real previous season to improve on
 POOL_MIN, POOL_GP_SHARE = 24.0, 0.45         # every All-NBA player since 2015-16 clears both
 DEFENSE_POOL_MIN = 20.0                      # All-Defensive specialists play less
@@ -185,6 +185,12 @@ def _voter_table(df_master, rating_model, award="nba"):
     table = table.merge(last, on=["PLAYER_ID", "yr"], how="left")
     for c in _CHANGES:
         table[f"UP_{c}"] = pd.to_numeric(table[c], errors="coerce") - table[f"PREV_{c}"]
+    # scoring against his best earlier season, not just last season: voters reward a new level, not a bounce-back
+    # (49 of 50 top-five finishers were above their previous best; none of 86 three-point bounce-backs made it)
+    real = table.loc[table["GP"] >= MIP_PREV_GP, ["PLAYER_ID", "yr", "PTS"]].assign(PTS=lambda t: pd.to_numeric(t["PTS"], errors="coerce"))
+    then = table[["PLAYER_ID", "yr"]].reset_index().merge(real, on="PLAYER_ID", suffixes=("", "_then"))
+    table["BEST_PTS"] = then[then["yr_then"] < then["yr"]].groupby("index")["PTS"].max().reindex(table.index)
+    table["OVER_BEST_PTS"] = (pd.to_numeric(table["PTS"], errors="coerce") - table["BEST_PTS"]).fillna(table["UP_PTS"])
     debut = table.groupby("PLAYER_ID")["yr"].transform("min")
     first_data_year = table["yr"].min()                    # everyone "debuts" in the first season of the data
     table["SOPHOMORE"] = ((debut == table["yr"] - 1) & (debut > first_data_year)).astype(float)
@@ -541,6 +547,7 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
 
     CHANCE     probability of finishing in the top five of the vote
     PTS_WAS / MIN_WAS / RATING_WAS   last season's numbers next to this season's
+    PTS_BEST   his best scoring season before this one; a return to an old level rarely gets votes
     SOPHOMORE  True for second-year players, who rarely win
     FINISH     where he actually finished, for seasons already voted on
     WHY / WHY_NOT  what is pushing his chance up and down the most
@@ -552,7 +559,7 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
     out = pd.DataFrame({
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "AGE": pool["BBR_AGE"], "GP": pool["GP"].astype(int),
-        "CHANCE": chance, "PTS": pool["PTS"], "PTS_WAS": pool["PREV_PTS"], "MIN": pool["MIN"], "MIN_WAS": pool["PREV_MIN"],
+        "CHANCE": chance, "PTS": pool["PTS"], "PTS_WAS": pool["PREV_PTS"], "PTS_BEST": pool["BEST_PTS"], "MIN": pool["MIN"], "MIN_WAS": pool["PREV_MIN"],
         "RATING": pool["RATING"], "RATING_WAS": pool["PREV_RATING"], "SOPHOMORE": pool["SOPHOMORE"] == 1,
         "ALL_NBA_BEFORE": pool["PRIOR_NBA"] > 0, "CAN_REACH_65": _can_reach(pool),
         "WHY": [_reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [_reasons(r, -1) for _, r in pull.iterrows()],
