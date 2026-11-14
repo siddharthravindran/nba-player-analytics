@@ -237,9 +237,9 @@ def _project_season(table, pool, X, Z, season, stats_too=True):
     average if he has changed teams. The UP_ changes are pulled toward "no change".
 
     Games played is projected too: the games he has, plus the rest of the
-    schedule at the rate players with his last season have gone on to play
-    (_games_rate). Otherwise four missed games in November count like missing
-    a third of a season.
+    schedule at the usual rate for a rotation player (about 82%), the same for
+    everyone. So the games he has already missed count for what they are, and
+    four missed games in November no longer look like missing a third of a season.
 
     Only the scoring changes. The stats shown in the tables stay the real ones.
     stats_too=False projects the games and leaves the stats as they are.
@@ -283,32 +283,13 @@ def _project_season(table, pool, X, Z, season, stats_too=True):
     if "GP_SHARE" in stats:
         past = pool.loc[~here].groupby("SEASON")["GP_SHARE"]
         usual, usual_spread = past.mean().mean(), past.std().mean()
-        before = table[table["yr"] < year].groupby("PLAYER_ID")["yr"].min()          # rookies have no entry
-        was = table[table["yr"] == year - 1].set_index("PLAYER_ID")["GP_SHARE"]
-        was = pd.Series(cur["PLAYER_ID"].map(was).to_numpy(), index=cur.index)
-        was = was.where(was.notna() | ~cur["PLAYER_ID"].isin(before.index), 0.0)     # a veteran who sat out all of last season
-        base, slope = _games_rate(table, season)
-        rate = (base + slope * was).fillna(usual).clip(0.0, 1.0)
-        share = ((games + left * rate) / (cur["TEAM_GAMES"] + left)).clip(upper=1.0)
+        # the rest of the schedule at the usual rate for everyone: last season's injuries are not held against him
+        share = ((games + left * usual) / (cur["TEAM_GAMES"] + left)).clip(upper=1.0)
         projected["GP_SHARE"] = ((share - usual) / usual_spread).clip(-5, 5)
 
     Z = Z.copy()
     Z.loc[cur.index] = projected[stats]
     return Z
-
-
-def _games_rate(table, season, min_min=20.0):
-    """Share of games a rotation player goes on to play, from the share he played the season before.
-
-    A straight-line fit on every finished season. One injured season is only
-    partly repeated: the slope is well under 1.
-    """
-    done = table[table["SEASON"] < season]
-    was = done[["PLAYER_ID", "yr", "GP_SHARE", "MIN"]].assign(yr=done["yr"] + 1).rename(columns={"GP_SHARE": "WAS", "MIN": "MIN_WAS"})
-    both = done.merge(was, on=["PLAYER_ID", "yr"])
-    both = both[both["MIN_WAS"] >= min_min]
-    slope, base = np.polyfit(both["WAS"].astype(float), both["GP_SHARE"].astype(float), 1)
-    return base, slope
 
 
 def _can_reach(pool):
