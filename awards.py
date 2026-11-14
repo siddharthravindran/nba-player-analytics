@@ -73,9 +73,10 @@ GAMES_RULE_FROM, GAMES_RULE, SEASON_GAMES = "2023-24", 65, 82
 # The league's count is not always the stat sheet's: in 2025-26 three First Team players show 64 games here
 # (two won "extraordinary circumstances" appeals). One game of slack keeps the filter from ruling out real picks.
 GAMES_SLACK = 1
-# A season in progress is scored on the line each player is headed for, not the dozen games he has (_project_season).
-# His numbers so far are weighed against this many games of his last season. 25 is a judgment, not a fitted value.
+# A season in progress: games played are projected to the end of the schedule for every award (_project_season).
+# For All-Defensive the stats are also weighed against this many games of last season. 25 is a judgment, not fitted.
 EARLY_PRIOR_GAMES = 25
+_PULL_TO_LAST_SEASON = {"defense"}           # the awards whose stats are pulled toward last season; games are projected for all
 EARLY_PRIOR_MIN_GP = 20                      # a "last season" shorter than this is skipped for the one before
 _TEAM_STATS = ["W_PCT", "DEF_RATING", "ONOFF_DEF_RATING"]         # say little about him once he has changed teams
 _NOT_PROJECTED = ["PRIOR", "PRIOR_NBA", "SOPHOMORE", "BBR_AGE"]   # facts about him, not this season's play
@@ -217,9 +218,11 @@ def _voter_table(df_master, rating_model, award="nba"):
     by_season = X.groupby(pool["SEASON"])
     Z = ((X - by_season.transform("mean")) / by_season.transform("std").replace(0, np.nan)).clip(-5, 5).fillna(0)
     if in_progress and (pool["SEASON"] == in_progress).any():
-        # Most Improved is about how far he has moved from last season, so pulling him back toward it would
-        # erase what is being measured (tried: nobody clears 3%). There only the games are projected.
-        Z = _project_season(table, pool, X, Z, in_progress, stats_too=award != "mip")
+        # Games are projected for every award. Stats are pulled toward last season only for All-Defensive:
+        # defensive numbers are the noisiest after a dozen games, and that vote leans on reputation. Scoring and
+        # role settle fast and a real leap (a second-year player) should count, so All-NBA, All-Star and
+        # Most Improved are scored on this season as it stands.
+        Z = _project_season(table, pool, X, Z, in_progress, stats_too=award in _PULL_TO_LAST_SEASON)
     return pool, Z
 
 
@@ -447,10 +450,10 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     WHY / WHY_NOT  the stats pushing his chance up and down the most
     RATING_RANK   where the impact model has him in the same pool, for contrast
 
-    During a season this is a projection of the final vote: his numbers so far
-    are pulled toward his last season by how much of the schedule is left
-    (_project_season), and his games are projected at last season's rate.
-    It can't know about injuries still to come.
+    During a season the inputs are this season's per-game numbers and his
+    team's record so far: "if the vote were today on today's pace". Only his
+    games are projected to the end of the schedule (_project_season). It can't
+    know about injuries still to come.
     """
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
     eligible = _can_reach(pool)
