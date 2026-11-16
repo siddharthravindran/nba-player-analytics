@@ -282,10 +282,15 @@ def _voter_table(df_master, rating_model, award="nba"):
     table["name_key"] = table["PLAYER_NAME"].map(norm_name)
     table["yr"] = table["SEASON"].str[:4].astype(int)
 
-    # this season against last: UP_PTS and so on, and whether last season was his first
-    last = table[["PLAYER_ID", "yr", "GP"] + _CHANGES].apply(lambda c: pd.to_numeric(c, errors="coerce") if c.name != "PLAYER_ID" else c)
-    last = last.assign(yr=last["yr"] + 1).rename(columns={c: f"PREV_{c}" for c in ["GP"] + _CHANGES})
-    table = table.merge(last, on=["PLAYER_ID", "yr"], how="left")
+    # this season against his last real season (20+ games): last season, or the one before if he barely played
+    # (Ty Jerome 2026-27: 15 games in 2025-26, so 2024-25 is the baseline). UP_PTS and so on.
+    seasons = table[["PLAYER_ID", "yr", "GP"] + _CHANGES].apply(lambda c: pd.to_numeric(c, errors="coerce") if c.name != "PLAYER_ID" else c)
+    seasons = seasons[seasons["GP"] >= MIP_PREV_GP].rename(columns={c: f"PREV_{c}" for c in ["GP"] + _CHANGES})
+    last = None
+    for back in (1, 2):
+        b = seasons.assign(yr=seasons["yr"] + back).set_index(["PLAYER_ID", "yr"])
+        last = b if last is None else last.combine_first(b)
+    table = table.merge(last.reset_index(), on=["PLAYER_ID", "yr"], how="left")
     for c in _CHANGES:
         table[f"UP_{c}"] = pd.to_numeric(table[c], errors="coerce") - table[f"PREV_{c}"]
     # scoring against his best earlier season, not just last season: voters reward a new level, not a bounce-back
