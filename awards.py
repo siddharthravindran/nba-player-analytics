@@ -875,7 +875,7 @@ _NUMBERS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 
             "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "a few": 2, "a couple of": 2, "several": 3}
 _UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
 _DURATION = re.compile(r"(\d+|" + "|".join(sorted(_NUMBERS, key=len, reverse=True)) + r")"
-                       r"(?:\s*(?:-|to|or)\s*(?:\d+|" + "|".join(_NUMBERS) + r"))?\s+(day|week|month)s?", re.I)
+                       r"(?:\s*(?:-|to|or)\s*(?:\d+|" + "|".join(_NUMBERS) + r"))?\s+(?:more\s+|additional\s+)?(day|week|month)s?", re.I)
 
 
 def _games_out(row, today, left):
