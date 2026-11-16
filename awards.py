@@ -85,6 +85,7 @@ _PULL_TO_LAST_SEASON = {"defense"}
 # the games projection and the 65-game rule. Weeks to games: about 3.5 games a week. Clear it when he is back.
 KNOWN_ABSENCES = {}
 GAMES_PER_WEEK = 3.5
+INDEFINITE_GAMES = 10                        # "out" with no timeline: about three weeks. A judgment, not fitted
 # All-Star: coaches and media pass over players who have missed a lot by the vote. Starters are picked about
 # 40 games in, reserves about 50; more than about 10 games missed by then is roughly the cut-off (an estimate).
 ALLSTAR_VOTE_AT = {"starter": 40, "reserve": 50}
@@ -97,7 +98,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "fit_allstar_model", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -196,11 +197,60 @@ def _mvp_votes(refresh=False):
                          "share": share})
 
 
+RISING_STARS_TEAMS = {"Team Candace"}       # 2025's tournament included a rookie/sophomore team; not All-Stars
+
+
+def _allstar_selections(refresh=False):
+    """Every All-Star selection since 2015-16 (Basketball-Reference box scores): name_key, yr, weight.
+
+    The box scores list who played; the notes add players selected but hurt
+    ("did not play due to injury") and name their replacements, who are taken
+    out: a replacement is the commissioner's pick, not the vote's. From 2025
+    the game is a tournament over several pages, and the Rising Stars team is
+    left out (RISING_STARS_TEAMS).
+    """
+    cache = DATA_DIR / "allstar_rosters.parquet"
+    if cache.exists() and not refresh:
+        raw = pd.read_parquet(cache)
+    else:
+        from io import StringIO
+        rows = []
+        for year in range(int(min(SEASONS)[:4]) + 1, int(max(SEASONS)[:4]) + 1):
+            main = _get(f"https://www.basketball-reference.com/allstar/NBA_{year}.html")
+            games = sorted(set(re.findall(rf'href="/allstar/({year}02\d+NBA)\.html"', main)))
+            pages = [main] + [_get(f"https://www.basketball-reference.com/allstar/{g}.html") for g in games]
+            for html in pages:
+                if "line_score" not in html:
+                    continue
+                for tid in re.findall(r'<table[^>]*id="([^"]+)"', html):
+                    if tid == "line_score":
+                        continue
+                    at = html.find(f'id="{tid}"')
+                    t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+                    for p in t.iloc[:, 0]:
+                        if isinstance(p, str) and p not in ("Reserves", "Starters", "Team Totals"):
+                            rows.append({"yr": year - 1, "player": p, "team": tid, "kind": "played"})
+                text = re.sub(r"<[^>]+>", "", html)
+                for who, team, rest in re.findall(r"([A-Z][\w.'\- ]{2,40}?) \(([^()]+)\): Did not play due to injury;?([^\n]{0,120})", text):
+                    rows.append({"yr": year - 1, "player": who.strip(), "team": team, "kind": "injured"})
+                    for sub in re.findall(r"Replaced by ([A-Z][\w.'\- ]+?)(?:$| and|\s{2})", rest) + \
+                               re.findall(r"([A-Z][\w.'\- ]+?) named as replacement", rest):
+                        rows.append({"yr": year - 1, "player": sub.strip(), "team": team, "kind": "replacement"})
+        raw = pd.DataFrame(rows).drop_duplicates()
+        raw.to_parquet(cache)
+    raw = raw[~raw["team"].isin(RISING_STARS_TEAMS)].assign(name_key=lambda r: r["player"].map(norm_name))
+    out = raw.loc[raw["kind"].isin(["played", "injured"]), ["name_key", "yr"]].drop_duplicates()
+    subs = raw.loc[raw["kind"] == "replacement", ["name_key", "yr"]].drop_duplicates()
+    out = out.merge(subs, how="left", indicator=True).query("_merge == 'left_only'").drop(columns="_merge")
+    return out.assign(weight=1)
+
+
 _AWARDS = {   # award -> (selections, stats, minimum minutes, team labels)
     "nba": (_allnba_selections, VOTER_STATS, POOL_MIN, TEAM_NAMES),
     "defense": (_alldefense_selections, DEFENSE_STATS, DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
     "mip": (_mip_selections, MIP_STATS, MIP_POOL_MIN, {1: "top 5"}),
     "mvp": (_mvp_votes, VOTER_STATS, POOL_MIN, {1: "MVP"}),
+    "star": (_allstar_selections, VOTER_STATS, POOL_MIN, {1: "All-Star"}),
 }
 MVP_PENALTIES = (0.003, 0.01, 0.03, 0.1, 0.3)
 
@@ -586,18 +636,24 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
     SPOT     "starter" for a conference's top five, "reserve" for the rest of the 12, "next" for the replacements
     SCORE    the voting model's score (higher is better); it keeps separating players after CHANCE has hit zero
     AVAILABLE  chance he has missed no more than ALLSTAR_MISSED_LIMIT games by the vote
-    CHANCE   his chance of an All-NBA spot, for scale
+    CHANCE   his chance of being picked, from the All-Star voting model
     RATING_RANK  where the impact model has him in his conference, for contrast
 
-    This borrows the All-NBA voting model — there is no All-Star voting history
-    in the data to train on. The two honours reward the same things (scoring,
-    winning, playing), but All-Star starters are half fan vote, and popularity
-    is not something the data sees. Positions are ignored, and there is no
+    Uses the All-Star voting model (fit_allstar_model), trained on real
+    All-Star selections; pass any voters, it fits that model once if needed.
+    All-Star starters are half fan vote, and popularity is only seen through
+    past selections. Positions are ignored, and there is no
     65-game rule: the vote happens in January. Coaches and media do pass over
     players who have missed a lot, though: starters are ranked on their chance
     of having missed no more than ALLSTAR_MISSED_LIMIT games by game 40, the
     rest on the same by game 50 (AVAILABLE). KNOWN_ABSENCES count as missed.
     """
+    if voters is None or voters.award != "star":
+        key = (id(df_master), id(rating_model))
+        if key not in _allstar_cache:
+            _allstar_cache.clear()
+            _allstar_cache[key] = fit_allstar_model(df_master, rating_model, verbose=False)
+        voters = _allstar_cache[key]
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season, games_rule=False)
     score = pull.sum(axis=1) + voters.intercept
     with np.errstate(divide="ignore"):                       # odds times the chance he's available; 0 sinks him
@@ -891,7 +947,9 @@ def _games_out(row, today, left):
         days = (int(n) if n.isdigit() else _NUMBERS[n]) * _UNIT_DAYS[m.group(2).lower()]
         since = (today - row["Update"]).days if pd.notna(row["Update"]) else 0
         return round(max(days - since, 0) / 7 * GAMES_PER_WEEK), f"{m.group(0)} from {row['Update']:%b %d}"
-    return 1.0, "out, no timeline"
+    if re.search(r"(?:out|OUT|Out) (?:for|on) \w+'?s? \(", text) or re.search(r"did not play (?:on|in) \w+", text, re.I):
+        return 1.0, "out for one game"
+    return float(INDEFINITE_GAMES), "out indefinitely"
 
 
 def use_injury_report(df_master, season="2026-27", today=None, refresh=False):
@@ -900,8 +958,8 @@ def use_injury_report(df_master, season="2026-27", today=None, refresh=False):
     Timelines are read from the text ("re-evaluated in approximately six weeks",
     "at least four to six weeks", "3-4 months"), always the shorter end and
     counted from the update date, at GAMES_PER_WEEK. "Re-evaluated in" is a
-    checkup, not a return, so these lean short. "Out" with no timeline counts
-    as one game; day-to-day as none. Set your own numbers after calling this:
+    checkup, not a return, so these lean short. "Out" for a named game counts
+    as one game; "out" with no timeline as INDEFINITE_GAMES; day-to-day as none. Set your own numbers after calling this:
     KNOWN_ABSENCES["Stephen Curry"] = 12 overrides the report.
     """
     rep = fetch_injuries(force=refresh)
@@ -919,3 +977,67 @@ def use_injury_report(df_master, season="2026-27", today=None, refresh=False):
     KNOWN_ABSENCES.clear()
     KNOWN_ABSENCES.update({p: g for p, g, ok in zip(out["Player"], out["GAMES"], out["IN_DATA"]) if ok and g > 0})
     return out
+
+
+
+# ---------------------------------------------------------------- All-Star
+def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
+    """All-Star voting model, trained on every All-Star selection since 2015-16.
+
+    A logistic regression like All-NBA, but on All-Star selections (injured
+    selections in, their replacements out), so it learns what All-Star voters
+    and coaches reward rather than borrowing the All-NBA vote. PRIOR is past
+    All-Star selections. Checked one season at a time: each conference's 12
+    most likely against who was really picked.
+
+    Caveat: the stats are full-season numbers, but the vote happens about 50
+    games in, so the training sees a little of what came after the vote.
+    """
+    pool, Z = _voter_table(df_master, rating_model, "star")
+    known = pool["DECIDED"].to_numpy()
+    y = (pool["VOTES"] > 0).to_numpy()
+    conf = np.where(pool["TEAM_ABBREVIATION"].isin(EAST), "East", "West")
+    seasons = sorted(pool.loc[known, "SEASON"].unique())
+
+    def held_out(C):
+        chance = pd.Series(np.nan, index=pool.index)
+        for s in seasons:
+            test = known & (pool["SEASON"] == s).to_numpy()
+            fit = LogisticRegression(C=C, max_iter=5000).fit(Z[known & ~test], y[known & ~test])
+            chance[test] = fit.predict_proba(Z[test])[:, 1]
+        return chance
+
+    if penalty is None:
+        loss = {}
+        for C in PENALTIES:
+            p = held_out(C)[known].clip(1e-6, 1 - 1e-6)
+            loss[C] = float(-(np.where(y[known], np.log(p), np.log(1 - p))).mean())
+        penalty = min(loss, key=loss.get)
+    chance = held_out(penalty)
+
+    rows = []
+    for s in seasons:
+        for c in ("East", "West"):
+            here = (pool["SEASON"] == s).to_numpy() & (conf == c)
+            g = pool[here]
+            real = set(g.index[y[here]])
+            top = lambda col: set(g[col].nlargest(12).index) if isinstance(col, str) else set(col[here].nlargest(12).index)
+            rows.append({"SEASON": s, "CONF": c, "PICKED": len(real), "RIGHT_OF_12": len(top(chance) & real),
+                         "TOP_SCORERS": len(top("PTS") & real), "TOP_RATING": len(top("RATING") & real)})
+    check = pd.DataFrame(rows)
+    fit = LogisticRegression(C=penalty, max_iter=5000).fit(Z[known], y[known])
+    weights = pd.Series(fit.coef_[0], index=Z.columns).sort_values(key=np.abs, ascending=False)
+    if verbose:
+        n = 24 * len(seasons)
+        print(f"\nAll-Star voting model: {int(y[known].sum())} selections over {len(seasons)} seasons, "
+              f"{int(known.sum())} player-seasons, penalty C={penalty:g}")
+        print(f"Each season predicted without seeing it: {check['RIGHT_OF_12'].sum()} of {n} spots right "
+              f"({check['RIGHT_OF_12'].sum() / len(seasons):.1f} of 24 a season)")
+        print(f"  for comparison, each conference's 12 top scorers get {check['TOP_SCORERS'].sum()}, "
+              f"its 12 best impact ratings {check['TOP_RATING'].sum()}")
+        lab = lambda k: "past All-Star selections" if k == "PRIOR" else LABELS[k]
+        print("What voters reward most: " + ", ".join(f"{lab(k)} ({v:+.2f})" for k, v in weights.head(6).items()))
+    return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, None, "star")
+
+
+_allstar_cache = {}
