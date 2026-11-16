@@ -262,6 +262,7 @@ def _voter_table(df_master, rating_model, award="nba"):
         table = table[table["PREV_GP"] >= MIP_PREV_GP]
 
     pool = table[(table["MIN"] >= pool_min) & (table["GP_SHARE"] >= POOL_GP_SHARE)].copy()
+    pool["REACH_65"] = _reach_chance(pool, in_progress)
     left_out = table[(table["VOTES"] > 0) & ~table.index.isin(pool.index)]
     if len(left_out):
         print(f"⚠️ {len(left_out)} selected players fall outside the pool: "
@@ -344,6 +345,32 @@ def _project_season(table, pool, X, Z, season, stats_too=True):
     Z = Z.copy()
     Z.loc[cur.index] = projected[stats]
     return Z
+
+
+def _reach_chance(pool, in_progress):
+    """Chance he finishes with 65 games (less one of slack), 1.0 before the rule.
+
+    Finished seasons: 1 or 0. The season in progress: the games he still needs
+    against a beta-binomial for how many of the rest he plays, fitted to the
+    share of games rotation players played in finished seasons (missed games
+    come in clumps, so it is wider than a plain coin-flip per game). Games in
+    KNOWN_ABSENCES are taken off the games he can still play.
+    """
+    from scipy.stats import betabinom
+    out = _can_reach(pool).astype(float)
+    now = (pool["SEASON"] == in_progress) & (pool["SEASON"] >= GAMES_RULE_FROM)
+    if in_progress is None or not now.any():
+        return out
+    done = pool.loc[(pool["SEASON"] < in_progress), "GP_SHARE"].clip(0.005, 0.995)
+    m, v = done.mean(), done.var()
+    k = m * (1 - m) / v - 1
+    a, b = m * k, (1 - m) * k
+    cur = pool[now]
+    can_play = ((SEASON_GAMES - cur["TEAM_GAMES"]).clip(lower=0) - cur.get("OUT", 0)).clip(lower=0).astype(int)
+    need = (GAMES_RULE - GAMES_SLACK - cur["GP"]).astype(int)
+    p = [1.0 if g <= 0 else 0.0 if g > n else float(betabinom.sf(g - 1, n, a, b)) for g, n in zip(need, can_play)]
+    out.loc[cur.index] = p
+    return out
 
 
 def _can_reach(pool):
@@ -458,8 +485,12 @@ def _fit_votes(df_master, rating_model, award, penalty, verbose, title, yardstic
     return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, pd.DataFrame(missed), award)
 
 
-def _voter_scores(voters, df_master, rating_model, season):
-    """One season's rotation players, each stat's pull on the vote, and the chance of an All-NBA spot."""
+def _voter_scores(voters, df_master, rating_model, season, games_rule=True):
+    """One season's rotation players, each stat's pull on the vote, and the chance of an All-NBA spot.
+
+    With games_rule the chance is multiplied by REACH_65, the chance he gets to
+    65 games; All-Star has no such rule and passes False.
+    """
     pool, Z = _voter_table(df_master, rating_model, voters.award)
     here = (pool["SEASON"] == season).to_numpy()
     if not here.any():
@@ -467,6 +498,8 @@ def _voter_scores(voters, df_master, rating_model, season):
     pool, Z = pool[here], Z[here]
     pull = Z * voters.weights.reindex(Z.columns)
     chance = pd.Series(1 / (1 + np.exp(-(pull.sum(axis=1) + voters.intercept))), index=pool.index)
+    if games_rule:
+        chance = chance * pool["REACH_65"]
     return pool, pull, chance
 
 
@@ -482,6 +515,7 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     PROJECTED   1st / 2nd / 3rd if he is among the 15 most likely eligible players
     ACTUAL      what happened, for seasons already voted on
     CAN_REACH_65  False once he has missed too many games to qualify (2023-24 on)
+    REACH_65    chance he gets there; CHANCE is already multiplied by it
     WHY / WHY_NOT  the stats pushing his chance up and down the most
     RATING_RANK   where the impact model has him in the same pool, for contrast
 
@@ -498,7 +532,7 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
         "TEAM_GAMES": pool["TEAM_GAMES"].astype(int), "PTS": pool["PTS"], "W_PCT": pool["W_PCT"],
         "CHANCE": chance, "PROJECTED": _teams(chance, eligible),
-        "CAN_REACH_65": eligible, "RATING_RANK": pool["RATING"].rank(ascending=False).astype(int),
+        "CAN_REACH_65": eligible, "REACH_65": pool["REACH_65"], "RATING_RANK": pool["RATING"].rank(ascending=False).astype(int),
         "WHY": [reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [reasons(r, -1) for _, r in pull.iterrows()],
     })
     if pool["DECIDED"].any():
@@ -523,7 +557,7 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
     is not something the data sees. Positions are ignored, and there is no
     65-game rule: the vote happens in January.
     """
-    pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
+    pool, pull, chance = _voter_scores(voters, df_master, rating_model, season, games_rule=False)
     out = pd.DataFrame({
         "CONF": np.where(pool["TEAM_ABBREVIATION"].isin(EAST), "East", "West"),
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
@@ -572,6 +606,7 @@ def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=N
     out = pd.DataFrame({
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int), "MIN": pool["MIN"],
         "CHANCE": chance, "PROJECTED": _teams(chance, eligible, DEFENSE_TEAM_NAMES), "CAN_REACH_65": eligible,
+        "REACH_65": pool["REACH_65"],
         "D_RATING": pool["D_RATING"], "DBPM": get("BBR_DBPM"), "STL": get("STL"), "BLK": get("BLK"),
         "DEFLECTIONS": get("DEFLECTIONS"), "OPP_FG_DIFF": get("PCT_PLUSMINUS"), "RIM_FG_PCT": get("DEF_RIM_FG_PCT"),
         "WHY": [_reasons(r, 1) for _, r in pull.iterrows()],
@@ -609,7 +644,7 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "AGE": pool["BBR_AGE"], "GP": pool["GP"].astype(int),
         "CHANCE": chance, "PTS": pool["PTS"], "PTS_WAS": pool["PREV_PTS"], "PTS_BEST": pool["BEST_PTS"], "MIN": pool["MIN"], "MIN_WAS": pool["PREV_MIN"],
         "RATING": pool["RATING"], "RATING_WAS": pool["PREV_RATING"], "SOPHOMORE": pool["SOPHOMORE"] == 1,
-        "ALL_NBA_BEFORE": pool["PRIOR_NBA"] > 0, "CAN_REACH_65": _can_reach(pool),
+        "ALL_NBA_BEFORE": pool["PRIOR_NBA"] > 0, "CAN_REACH_65": _can_reach(pool), "REACH_65": pool["REACH_65"],
         "WHY": [_reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [_reasons(r, -1) for _, r in pull.iterrows()],
     })
     if pool["DECIDED"].any() and "FINISH" in pool.columns:
@@ -630,6 +665,12 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
 
 def _softmax(s):
     e = np.exp(s - s.max())
+    return e / e.sum()
+
+
+def _weighted_softmax(s, weight):
+    """Softmax where each player's term is scaled by the chance he is eligible at all."""
+    e = np.exp(s - s.max()) * weight
     return e / e.sum()
 
 
@@ -734,7 +775,7 @@ def _mvp_label(k):
 def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
     """Each eligible player's chance of winning MVP for a season, and his expected share of the vote.
 
-    WIN_CHANCE   chance he wins; adds up to 1 over the season's eligible players
+    WIN_CHANCE   chance he wins; adds up to 1, and counts his chance of reaching 65 games (REACH_65)
     SHARE_OF_POINTS  his expected share of all the voting points cast; adds up to 1 over the players
     ACTUAL_SHARE / FINISH   what happened, for seasons already voted on
     TEAM_RANK    his team's record among all teams
@@ -756,12 +797,14 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
     pool, Z = pool[keep], Z[keep]
     pull = Z * voters.weights.reindex(Z.columns)
     score = pull.sum(axis=1).to_numpy()
+    reach = pool["REACH_65"].to_numpy(float)
     reasons = lambda row, sign: ", ".join(_mvp_label(k) for k, v in (row * sign).nlargest(2).items() if v > 0.15)
     out = pd.DataFrame({
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
         "PTS": pool["PTS"], "REB": pool["REB"], "AST": pool["AST"], "W_PCT": pool["W_PCT"],
         "TEAM_RANK": pool["TEAM_RANK"].astype(int),
-        "WIN_CHANCE": _softmax(voters.temperature * score), "SHARE_OF_POINTS": _softmax(score),
+        "WIN_CHANCE": _weighted_softmax(voters.temperature * score, reach), "SHARE_OF_POINTS": _softmax(score),
+        "REACH_65": reach,
         "RATING_RANK": rank_all.reindex(pool.index),
         "WHY": [reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [reasons(r, -1) for _, r in pull.iterrows()],
     }, index=pool.index)
