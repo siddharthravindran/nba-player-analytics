@@ -34,13 +34,14 @@ What it can't see: positions (teams were two guards, two forwards and a center
 until 2022-23; the model ignores that), injuries still to come, appeals against
 the 65-game rule, and narrative.
 """
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-from bbref_stats import DATA_DIR, _get
+from bbref_stats import DATA_DIR, _get, fetch_injuries
 from nba_viz_utils import SEASONS, norm_name
 from player_ranking import _regular_season, rank_players
 from salaries import ALLNBA_WEIGHT, _allnba_selections
@@ -82,7 +83,12 @@ _PULL_TO_LAST_SEASON = {"defense"}
 # Games a player is known to be missing from today, for the season in progress: {"Stephen Curry": 12}.
 # Set it in the notebook (KNOWN_ABSENCES["Stephen Curry"] = 12) and every award counts those games as missed, in
 # the games projection and the 65-game rule. Weeks to games: about 3.5 games a week. Clear it when he is back.
-KNOWN_ABSENCES = {}           # the awards whose stats are pulled toward last season; games are projected for all
+KNOWN_ABSENCES = {}
+GAMES_PER_WEEK = 3.5
+# All-Star: coaches and media pass over players who have missed a lot by the vote. Starters are picked about
+# 40 games in, reserves about 50; more than about 10 games missed by then is roughly the cut-off (an estimate).
+ALLSTAR_VOTE_AT = {"starter": 40, "reserve": 50}
+ALLSTAR_MISSED_LIMIT = 10           # the awards whose stats are pulled toward last season; games are projected for all
 EARLY_PRIOR_MIN_GP = 20                      # a "last season" shorter than this is skipped for the one before
 _TEAM_STATS = ["W_PCT", "DEF_RATING", "ONOFF_DEF_RATING"]         # say little about him once he has changed teams
 _NOT_PROJECTED = ["PRIOR", "PRIOR_NBA", "SOPHOMORE", "BBR_AGE"]   # facts about him, not this season's play
@@ -91,7 +97,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -219,7 +225,7 @@ def _voter_table(df_master, rating_model, award="nba"):
     table = pd.concat(parts, ignore_index=True)
     out = table["PLAYER_NAME"].map(KNOWN_ABSENCES) if KNOWN_ABSENCES else pd.Series(np.nan, index=table.index)
     table["OUT"] = out.where(table["SEASON"] == in_progress).fillna(0).astype(float)
-    unknown = set(KNOWN_ABSENCES) - set(table.loc[table["SEASON"] == in_progress, "PLAYER_NAME"])
+    unknown = set(KNOWN_ABSENCES) - set(df.loc[df["SEASON"] == in_progress, "PLAYER_NAME"])
     if unknown:
         print(f"⚠️ KNOWN_ABSENCES names not found this season: {sorted(unknown)}")
     table = table.sort_values("GP").drop_duplicates(["PLAYER_ID", "SEASON"], keep="last").sort_index().reset_index(drop=True)
@@ -263,6 +269,8 @@ def _voter_table(df_master, rating_model, award="nba"):
 
     pool = table[(table["MIN"] >= pool_min) & (table["GP_SHARE"] >= POOL_GP_SHARE)].copy()
     pool["REACH_65"] = _reach_chance(pool, in_progress)
+    for spot, at in ALLSTAR_VOTE_AT.items():
+        pool[f"ALLSTAR_OK_{spot.upper()}"] = _allstar_chance(pool, in_progress, at)
     left_out = table[(table["VOTES"] > 0) & ~table.index.isin(pool.index)]
     if len(left_out):
         print(f"⚠️ {len(left_out)} selected players fall outside the pool: "
@@ -347,6 +355,41 @@ def _project_season(table, pool, X, Z, season, stats_too=True):
     return Z
 
 
+def _availability(pool, in_progress):
+    """Beta parameters for the share of games a rotation player plays, from finished seasons."""
+    done = pool.loc[(pool["SEASON"] < in_progress), "GP_SHARE"].clip(0.005, 0.995)
+    m, v = done.mean(), done.var()
+    k = m * (1 - m) / v - 1
+    return m * k, (1 - m) * k
+
+
+def _chance_to_play(need, can_play, a, b):
+    """Chance of playing at least `need` of `can_play` games: beta-binomial, so missed games come in clumps."""
+    from scipy.stats import betabinom
+    return np.array([1.0 if g <= 0 else 0.0 if g > n else float(betabinom.sf(g - 1, n, a, b))
+                     for g, n in zip(np.asarray(need, int), np.asarray(can_play, int))])
+
+
+def _allstar_chance(pool, in_progress, at):
+    """Chance he has missed no more than ALLSTAR_MISSED_LIMIT games by the time the All-Star vote is `at` games in."""
+    out = pd.Series(1.0, index=pool.index)
+    now = pool["SEASON"] == in_progress
+    if in_progress is None or not now.any():
+        return out
+    a, b = _availability(pool, in_progress)
+    cur = pool[now]
+    window = (at - cur["TEAM_GAMES"]).clip(lower=0)
+    out_then = cur.get("OUT", 0)
+    out_then = np.minimum(out_then, window) if np.ndim(out_then) else 0
+    missed = cur["TEAM_GAMES"] - cur["GP"] + out_then
+    can_play = (window - out_then).clip(lower=0)
+    need = can_play - (ALLSTAR_MISSED_LIMIT - missed)              # games he must play of the ones he can
+    p = _chance_to_play(need, can_play, a, b)
+    p[(ALLSTAR_MISSED_LIMIT - missed).to_numpy() < 0] = 0.0
+    out.loc[cur.index] = p
+    return out
+
+
 def _reach_chance(pool, in_progress):
     """Chance he finishes with 65 games (less one of slack), 1.0 before the rule.
 
@@ -356,20 +399,14 @@ def _reach_chance(pool, in_progress):
     come in clumps, so it is wider than a plain coin-flip per game). Games in
     KNOWN_ABSENCES are taken off the games he can still play.
     """
-    from scipy.stats import betabinom
     out = _can_reach(pool).astype(float)
     now = (pool["SEASON"] == in_progress) & (pool["SEASON"] >= GAMES_RULE_FROM)
     if in_progress is None or not now.any():
         return out
-    done = pool.loc[(pool["SEASON"] < in_progress), "GP_SHARE"].clip(0.005, 0.995)
-    m, v = done.mean(), done.var()
-    k = m * (1 - m) / v - 1
-    a, b = m * k, (1 - m) * k
+    a, b = _availability(pool, in_progress)
     cur = pool[now]
-    can_play = ((SEASON_GAMES - cur["TEAM_GAMES"]).clip(lower=0) - cur.get("OUT", 0)).clip(lower=0).astype(int)
-    need = (GAMES_RULE - GAMES_SLACK - cur["GP"]).astype(int)
-    p = [1.0 if g <= 0 else 0.0 if g > n else float(betabinom.sf(g - 1, n, a, b)) for g, n in zip(need, can_play)]
-    out.loc[cur.index] = p
+    can_play = ((SEASON_GAMES - cur["TEAM_GAMES"]).clip(lower=0) - cur.get("OUT", 0)).clip(lower=0)
+    out.loc[cur.index] = _chance_to_play(GAMES_RULE - GAMES_SLACK - cur["GP"], can_play, a, b)
     return out
 
 
@@ -548,6 +585,7 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
 
     SPOT     "starter" for a conference's top five, "reserve" for the rest of the 12, "next" for the replacements
     SCORE    the voting model's score (higher is better); it keeps separating players after CHANCE has hit zero
+    AVAILABLE  chance he has missed no more than ALLSTAR_MISSED_LIMIT games by the vote
     CHANCE   his chance of an All-NBA spot, for scale
     RATING_RANK  where the impact model has him in his conference, for contrast
 
@@ -555,21 +593,36 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
     in the data to train on. The two honours reward the same things (scoring,
     winning, playing), but All-Star starters are half fan vote, and popularity
     is not something the data sees. Positions are ignored, and there is no
-    65-game rule: the vote happens in January.
+    65-game rule: the vote happens in January. Coaches and media do pass over
+    players who have missed a lot, though: starters are ranked on their chance
+    of having missed no more than ALLSTAR_MISSED_LIMIT games by game 40, the
+    rest on the same by game 50 (AVAILABLE). KNOWN_ABSENCES count as missed.
     """
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season, games_rule=False)
+    score = pull.sum(axis=1) + voters.intercept
+    with np.errstate(divide="ignore"):                       # odds times the chance he's available; 0 sinks him
+        as_starter = score + np.log(pool["ALLSTAR_OK_STARTER"])
+        as_reserve = score + np.log(pool["ALLSTAR_OK_RESERVE"])
     out = pd.DataFrame({
         "CONF": np.where(pool["TEAM_ABBREVIATION"].isin(EAST), "East", "West"),
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
-        "PTS": pool["PTS"], "W_PCT": pool["W_PCT"], "SCORE": pull.sum(axis=1) + voters.intercept, "CHANCE": chance,
+        "PTS": pool["PTS"], "W_PCT": pool["W_PCT"], "SCORE": score, "CHANCE": chance,
         "RATING": pool["RATING"], "WHY": [_reasons(r, 1) for _, r in pull.iterrows()],
+        "_STARTER": as_starter, "_RESERVE": as_reserve,
+        "OK_STARTER": pool["ALLSTAR_OK_STARTER"], "OK_RESERVE": pool["ALLSTAR_OK_RESERVE"],
     })
     out["RATING_RANK"] = out.groupby("CONF")["RATING"].rank(ascending=False).astype(int)
-    out = out.sort_values(["CONF", "SCORE"], ascending=[True, False])
-    out["RANK"] = out.groupby("CONF").cumcount() + 1
-    out = out[out["RANK"] <= spots + next_up].copy()
+    parts = []
+    for conf, g in out.groupby("CONF"):
+        starters = g.nlargest(5, "_STARTER")
+        rest = g.drop(starters.index).sort_values("_RESERVE", ascending=False)
+        g = pd.concat([starters, rest.head(spots + next_up - 5)])
+        g["RANK"] = np.arange(1, len(g) + 1)
+        g["AVAILABLE"] = np.where(g["RANK"] <= 5, g["OK_STARTER"], g["OK_RESERVE"])
+        parts.append(g)
+    out = pd.concat(parts)
     out["SPOT"] = np.select([out["RANK"] <= 5, out["RANK"] <= spots], ["starter", "reserve"], default="next")
-    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", "PTS", "W_PCT", "SCORE", "CHANCE", "RATING_RANK", "WHY"]
+    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", "PTS", "W_PCT", "SCORE", "CHANCE", "AVAILABLE", "RATING_RANK", "WHY"]
     out = out[cols].reset_index(drop=True)
     out.attrs.update(season=season)
     return out
@@ -815,3 +868,54 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out))
     return out.head(top) if top else out
+
+
+# ---------------------------------------------------------------- injuries
+_NUMBERS = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
+            "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "a few": 2, "a couple of": 2, "several": 3}
+_UNIT_DAYS = {"day": 1, "week": 7, "month": 30}
+_DURATION = re.compile(r"(\d+|" + "|".join(sorted(_NUMBERS, key=len, reverse=True)) + r")"
+                       r"(?:\s*(?:-|to|or)\s*(?:\d+|" + "|".join(_NUMBERS) + r"))?\s+(day|week|month)s?", re.I)
+
+
+def _games_out(row, today, left):
+    """Games still to miss from one injury-report line: (games, how it was read)."""
+    text = str(row["Description"])
+    if text.lower().startswith("out for season"):
+        return left, "out for season"
+    if not text.lower().startswith("out"):
+        return 0.0, "day to day"
+    m = _DURATION.search(text)
+    if m:
+        n = m.group(1).lower()
+        days = (int(n) if n.isdigit() else _NUMBERS[n]) * _UNIT_DAYS[m.group(2).lower()]
+        since = (today - row["Update"]).days if pd.notna(row["Update"]) else 0
+        return round(max(days - since, 0) / 7 * GAMES_PER_WEEK), f"{m.group(0)} from {row['Update']:%b %d}"
+    return 1.0, "out, no timeline"
+
+
+def use_injury_report(df_master, season="2026-27", today=None, refresh=False):
+    """Fill KNOWN_ABSENCES from Basketball-Reference's injury report and return what it read.
+
+    Timelines are read from the text ("re-evaluated in approximately six weeks",
+    "at least four to six weeks", "3-4 months"), always the shorter end and
+    counted from the update date, at GAMES_PER_WEEK. "Re-evaluated in" is a
+    checkup, not a return, so these lean short. "Out" with no timeline counts
+    as one game; day-to-day as none. Set your own numbers after calling this:
+    KNOWN_ABSENCES["Stephen Curry"] = 12 overrides the report.
+    """
+    rep = fetch_injuries(force=refresh)
+    today = pd.Timestamp(today or pd.Timestamp.today().normalize())
+    cur = _regular_season(df_master)
+    cur = cur[cur["SEASON"] == season]
+    names = dict(zip(cur["PLAYER_NAME"].map(norm_name), cur["PLAYER_NAME"]))
+    left = SEASON_GAMES - cur.groupby("TEAM_ABBREVIATION")["GP"].max().max()
+    rows = []
+    for _, r in rep.iterrows():
+        games, why = _games_out(r, today, left)
+        rows.append({"Player": names.get(norm_name(r["Player"]), r["Player"]), "IN_DATA": norm_name(r["Player"]) in names,
+                     "TEAM": r["Team"], "GAMES": games, "READ_AS": why, "Description": r["Description"]})
+    out = pd.DataFrame(rows).sort_values("GAMES", ascending=False).reset_index(drop=True)
+    KNOWN_ABSENCES.clear()
+    KNOWN_ABSENCES.update({p: g for p, g, ok in zip(out["Player"], out["GAMES"], out["IN_DATA"]) if ok and g > 0})
+    return out

@@ -330,6 +330,23 @@ def fetch_contract_years(force=False, max_age_days=7):
     return df
 
 
+def fetch_injuries(force=False, max_age_hours=6):
+    """Basketball-Reference's injury report: Player, Team, Update (a date), Description. Cached for six hours."""
+    from io import StringIO
+    cache = DATA_DIR / "bbref_injuries.parquet"
+    if cache.exists() and not force and (time.time() - cache.stat().st_mtime) < max_age_hours * 3600:
+        return pd.read_parquet(cache)
+    html = _get(f"{BASE}/friv/injuries.fcgi")
+    at = html.find('id="injuries"')
+    if at < 0:
+        raise ValueError("injury table not found")
+    df = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+    df["Update"] = pd.to_datetime(df["Update"], format="%a, %b %d, %Y", errors="coerce")
+    df.to_parquet(cache, index=False)
+    print(f"   🌐 injury report: {len(df)} players")
+    return df
+
+
 def fetch_contracts(force=False, max_age_days=7):
     """This season's salaries. Cached for a week — contracts change with trades and signings."""
     cache = DATA_DIR / "bbref_contracts_current.parquet"
