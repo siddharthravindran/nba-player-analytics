@@ -78,7 +78,11 @@ GAMES_SLACK = 1
 # A season in progress: games played are projected to the end of the schedule for every award (_project_season).
 # For All-Defensive the stats are also weighed against this many games of last season. 25 is a judgment, not fitted.
 EARLY_PRIOR_GAMES = 25
-_PULL_TO_LAST_SEASON = {"defense"}           # the awards whose stats are pulled toward last season; games are projected for all
+_PULL_TO_LAST_SEASON = {"defense"}
+# Games a player is known to be missing from today, for the season in progress: {"Stephen Curry": 12}.
+# Set it in the notebook (KNOWN_ABSENCES["Stephen Curry"] = 12) and every award counts those games as missed, in
+# the games projection and the 65-game rule. Weeks to games: about 3.5 games a week. Clear it when he is back.
+KNOWN_ABSENCES = {}           # the awards whose stats are pulled toward last season; games are projected for all
 EARLY_PRIOR_MIN_GP = 20                      # a "last season" shorter than this is skipped for the one before
 _TEAM_STATS = ["W_PCT", "DEF_RATING", "ONOFF_DEF_RATING"]         # say little about him once he has changed teams
 _NOT_PROJECTED = ["PRIOR", "PRIOR_NBA", "SOPHOMORE", "BBR_AGE"]   # facts about him, not this season's play
@@ -87,7 +91,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -213,6 +217,11 @@ def _voter_table(df_master, rating_model, award="nba"):
         one["GP_SHARE"] = (one["GP"] / played).clip(upper=1.0)
         parts.append(one.reset_index())
     table = pd.concat(parts, ignore_index=True)
+    out = table["PLAYER_NAME"].map(KNOWN_ABSENCES) if KNOWN_ABSENCES else pd.Series(np.nan, index=table.index)
+    table["OUT"] = out.where(table["SEASON"] == in_progress).fillna(0).astype(float)
+    unknown = set(KNOWN_ABSENCES) - set(table.loc[table["SEASON"] == in_progress, "PLAYER_NAME"])
+    if unknown:
+        print(f"⚠️ KNOWN_ABSENCES names not found this season: {sorted(unknown)}")
     table = table.sort_values("GP").drop_duplicates(["PLAYER_ID", "SEASON"], keep="last").sort_index().reset_index(drop=True)
     table["name_key"] = table["PLAYER_NAME"].map(norm_name)
     table["yr"] = table["SEASON"].str[:4].astype(int)
@@ -328,7 +337,8 @@ def _project_season(table, pool, X, Z, season, stats_too=True):
         past = pool.loc[~here].groupby("SEASON")["GP_SHARE"]
         usual, usual_spread = past.mean().mean(), past.std().mean()
         # the rest of the schedule at the usual rate for everyone: last season's injuries are not held against him
-        share = ((games + left * usual) / (cur["TEAM_GAMES"] + left)).clip(upper=1.0)
+        out = cur["OUT"].clip(upper=left) if "OUT" in cur.columns else 0.0            # KNOWN_ABSENCES
+        share = ((games + (left - out) * usual) / (cur["TEAM_GAMES"] + left)).clip(upper=1.0)
         projected["GP_SHARE"] = ((share - usual) / usual_spread).clip(-5, 5)
 
     Z = Z.copy()
@@ -338,7 +348,7 @@ def _project_season(table, pool, X, Z, season, stats_too=True):
 
 def _can_reach(pool):
     """From 2023-24: could he still finish with 65 games (less one of slack)? Earlier seasons had no minimum."""
-    left = (SEASON_GAMES - pool["TEAM_GAMES"]).clip(lower=0)
+    left = (SEASON_GAMES - pool["TEAM_GAMES"]).clip(lower=0) - pool.get("OUT", 0)
     return (pool["SEASON"] < GAMES_RULE_FROM) | (pool["GP"] + left >= GAMES_RULE - GAMES_SLACK)
 
 
