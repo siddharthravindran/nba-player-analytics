@@ -69,7 +69,8 @@ LABELS.update({"UP_PTS": "scoring jump", "UP_MIN": "more minutes", "UP_AST": "mo
                "UP_TS_PCT": "better efficiency", "UP_USG_PCT": "bigger role", "UP_PIE": "more all-round production",
                "UP_RATING": "better impact rating", "UP_WINS_PACE": "more wins added", "UP_W_PCT": "team improved",
                "OVER_BEST_PTS": "scoring above his previous best", "BBR_AGE": "age", "SOPHOMORE": "second-year player", "PRIOR_NBA": "already an All-NBA player"})
-MIP_POOL_MIN, MIP_PREV_GP = 20.0, 20         # needs a real previous season to improve on
+MIP_POOL_MIN, MIP_PREV_GP = 20.0, 15         # a "real" previous season: 15+ games. Held-out is the same at 10, 15
+                                             # or 20; 15 is a judgment (Ty Jerome's 15 games in 2025-26 count as his leap)
 POOL_MIN, POOL_GP_SHARE = 24.0, 0.45         # every All-NBA player since 2015-16 clears both
 DEFENSE_POOL_MIN = 20.0                      # All-Defensive specialists play less
 GAMES_RULE_FROM, GAMES_RULE, SEASON_GAMES = "2023-24", 65, 82
