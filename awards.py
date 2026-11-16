@@ -13,6 +13,8 @@
     fit_alldefense_model(df_master, model).weights         # what All-Defensive voters reward
     mip = fit_mip_model(df_master, model)                  # Most Improved: trained on who finished top five in that vote
     predict_mip(mip, df_master, model)                     # this season's candidates, with what changed
+    mvp = fit_mvp_model(df_master, model)                  # MVP: trained on every player's share of the vote
+    predict_mvp(mvp, df_master, model)                     # chance of winning and expected share of the vote
 
 player_ranking answers "who has played best". This answers a different
 question: given how voters have behaved since 2015-16, who gets a spot. The two
@@ -86,7 +88,7 @@ DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
 __all__ = ["AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
-           "fit_mip_model", "predict_mip"]
+           "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
 @dataclass
@@ -97,7 +99,8 @@ class AllNBAModel:
     seasons: list
     check: pd.DataFrame = field(default=None, repr=False)      # leave-one-season-out results
     missed: pd.DataFrame = field(default=None, repr=False)     # every wrong call in those runs
-    award: str = "nba"                                         # "nba" or "defense"
+    award: str = "nba"                                         # "nba", "defense", "mip" or "mvp"
+    temperature: float = 1.0                                   # MVP only: sharpens vote shares into a chance of winning
 
 
 def _alldefense_selections(refresh=False):
@@ -150,11 +153,46 @@ def _mip_selections(refresh=False):
                          "weight": 1, "finish": top["finish"]})
 
 
+def _mvp_votes(refresh=False):
+    """Every player who got an MVP vote (Basketball-Reference): name_key, yr, weight, finish, share.
+
+    share is the page's Share column: points won over points possible, so the
+    winner is near 1 and a season's shares add up to about 2.6. weight is the
+    share in thousandths, an integer like the other awards' weights; PRIOR adds
+    up the last three seasons of it ("past MVP votes").
+    """
+    cache = DATA_DIR / "mvp_voting.parquet"
+    if cache.exists() and not refresh:
+        raw = pd.read_parquet(cache)
+    else:
+        from io import StringIO
+        frames = []
+        for year in range(int(min(SEASONS)[:4]) + 1, int(max(SEASONS)[:4]) + 1):
+            html = _get(f"https://www.basketball-reference.com/awards/awards_{year}.html")
+            at = html.find('id="mvp"')
+            if at < 0:
+                continue                                                    # not voted on yet
+            t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+            t.columns = [c[-1] if isinstance(c, tuple) else c for c in t.columns]
+            t = t[["Rank", "Player", "Age", "Tm", "First", "Pts Won", "Pts Max", "Share"]].copy()
+            t.insert(0, "SEASON", f"{year - 1}-{str(year)[2:]}")
+            frames.append(t)
+        raw = pd.concat(frames, ignore_index=True)
+        raw = raw.astype(object).where(raw.notna(), None).astype("string")
+        raw.to_parquet(cache)
+    share = pd.to_numeric(raw["Share"], errors="coerce").fillna(0.0)
+    return pd.DataFrame({"name_key": raw["Player"].map(norm_name), "yr": raw["SEASON"].str[:4].astype(int),
+                         "weight": (share * 1000).round().astype(int), "finish": raw.groupby("SEASON").cumcount() + 1,
+                         "share": share})
+
+
 _AWARDS = {   # award -> (selections, stats, minimum minutes, team labels)
     "nba": (_allnba_selections, VOTER_STATS, POOL_MIN, TEAM_NAMES),
     "defense": (_alldefense_selections, DEFENSE_STATS, DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
     "mip": (_mip_selections, MIP_STATS, MIP_POOL_MIN, {1: "top 5"}),
+    "mvp": (_mvp_votes, VOTER_STATS, POOL_MIN, {1: "MVP"}),
 }
+MVP_PENALTIES = (0.003, 0.01, 0.03, 0.1, 0.3)
 
 
 def _voter_table(df_master, rating_model, award="nba"):
@@ -572,4 +610,155 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out), strict=strict)
+    return out.head(top) if top else out
+
+
+# ---------------------------------------------------------------- MVP
+# One winner a season is too few to learn from (11 since 2015-16), so the MVP model learns from every player's
+# share of the vote: a softmax over each season's pool, fitted to the shares. Its scores, sharpened by one
+# temperature fitted on held-out seasons, give each player's chance of winning; the chances add up to 1.
+
+def _softmax(s):
+    e = np.exp(s - s.max())
+    return e / e.sum()
+
+
+def _fit_shares(X, groups, targets, lam):
+    """Weights that make each season's softmax of X @ w match its vote shares, with an L2 penalty."""
+    from scipy.optimize import minimize
+
+    def loss(w):
+        s, total, grad = X @ w, lam * w @ w, 2 * lam * w
+        for ix, q in zip(groups, targets):
+            p = _softmax(s[ix])
+            total -= q @ np.log(p + 1e-12) / len(groups)
+            grad -= X[ix].T @ (q - p) / len(groups)
+        return total, grad
+    return minimize(loss, np.zeros(X.shape[1]), jac=True, method="L-BFGS-B").x
+
+
+def _mvp_frame(df_master, rating_model):
+    pool, Z = _voter_table(df_master, rating_model, "mvp")
+    votes = _mvp_votes().set_index(["name_key", "yr"])
+    pool["SHARE"] = [votes["share"].get(k, 0.0) for k in zip(pool["name_key"], pool["yr"])]
+    pool["FINISH"] = [votes["finish"].get(k, np.nan) for k in zip(pool["name_key"], pool["yr"])]
+    pool["ELIGIBLE"] = _can_reach(pool)
+    team_record = pool.sort_values("GP").groupby(["SEASON", "TEAM_ABBREVIATION"])["W_PCT"].last()
+    pool["TEAM_RANK"] = [team_record[s].rank(ascending=False, method="min")[t]
+                         for s, t in zip(pool["SEASON"], pool["TEAM_ABBREVIATION"])]
+    return pool, Z
+
+
+def fit_mvp_model(df_master, rating_model, penalty=None, verbose=True):
+    """MVP voting model, trained on every vote-getter's share since 2015-16, tested one season at a time.
+
+    Accuracy is the winner picked, the winner's rank, and how many of the real
+    top three are in the predicted top three, every season predicted without
+    seeing it. Yardsticks: the best impact rating on a top-three team, the best
+    impact rating anywhere, and the top scorer.
+    """
+    pool, Z = _mvp_frame(df_master, rating_model)
+    stats = list(Z.columns)
+    known = pool["DECIDED"].to_numpy() & pool["ELIGIBLE"].to_numpy()
+    seasons = sorted(pool.loc[pool["DECIDED"], "SEASON"].unique())
+    rows_of = {s: np.flatnonzero(known & (pool["SEASON"] == s).to_numpy()) for s in seasons}
+    X, share = Z.to_numpy(float), pool["SHARE"].to_numpy(float)
+    target = {s: share[ix] / share[ix].sum() for s, ix in rows_of.items()}
+
+    def held_out(lam):
+        scores = {}
+        for s in seasons:
+            train = [x for x in seasons if x != s]
+            w = _fit_shares(X, [rows_of[x] for x in train], [target[x] for x in train], lam)
+            scores[s] = X[rows_of[s]] @ w
+        return scores
+
+    if penalty is None:
+        loss = {lam: -np.mean([target[s] @ np.log(_softmax(sc) + 1e-12) for s, sc in held_out(lam).items()])
+                for lam in MVP_PENALTIES}
+        penalty = min(loss, key=loss.get)
+    scores = held_out(penalty)
+
+    def winner_loglik(t):
+        return -sum(np.log(_softmax(t * scores[s])[np.argmax(share[rows_of[s]])] + 1e-12) for s in seasons)
+    from scipy.optimize import minimize_scalar
+    temperature = float(minimize_scalar(winner_loglik, bounds=(0.5, 4.0), method="bounded").x)
+
+    rows = []
+    for s in seasons:
+        ix = rows_of[s]
+        here, sc = pool.iloc[ix], scores[s]
+        order = np.argsort(-sc)
+        real = np.argsort(-share[ix])
+        win = real[0]
+        yard = lambda m: here["PLAYER_NAME"].iloc[np.argmax(np.where(m, here["RATING"].to_numpy(float), -np.inf))]
+        rows.append({"SEASON": s, "WINNER": here["PLAYER_NAME"].iloc[win], "PICKED": here["PLAYER_NAME"].iloc[order[0]],
+                     "WINNER_RANK": int(np.flatnonzero(order == win)[0]) + 1,
+                     "WIN_CHANCE": float(_softmax(temperature * sc)[win]),
+                     "TOP3_OF_3": len(set(order[:3]) & set(real[:3])),
+                     "TOP_TEAM_RATING": yard(here["TEAM_RANK"].to_numpy() <= 3),
+                     "BEST_RATING": yard(np.ones(len(ix), bool)),
+                     "TOP_SCORER": here["PLAYER_NAME"].iloc[np.argmax(here["PTS"].to_numpy(float))]})
+    check = pd.DataFrame(rows)
+
+    w = _fit_shares(X, list(rows_of.values()), list(target.values()), penalty)
+    weights = pd.Series(w, index=stats).sort_values(key=np.abs, ascending=False)
+    if verbose:
+        n = len(seasons)
+        hits = lambda c: int((check[c] == check["WINNER"]).sum())
+        print(f"\nMVP voting model: {int((share[known] > 0).sum())} vote-getters over {n} seasons, "
+              f"{int(known.sum())} player-seasons, penalty {penalty:g}, temperature {temperature:.2f}")
+        print(f"Each season predicted without seeing it: winner picked {hits('PICKED')} of {n}, "
+              f"winner in the top three {int((check['WINNER_RANK'] <= 3).sum())} of {n}, "
+              f"real top three found {check['TOP3_OF_3'].sum()} of {3 * n}")
+        print(f"  for comparison, the best impact rating on a top-three team picks the winner {hits('TOP_TEAM_RATING')}, "
+              f"the best impact rating anywhere {hits('BEST_RATING')}, the top scorer {hits('TOP_SCORER')}")
+        print("What voters reward most: " + ", ".join(f"{_mvp_label(k)} ({v:+.2f})" for k, v in weights.head(6).items()))
+    return AllNBAModel(weights, 0.0, penalty, seasons, check, None, "mvp", temperature)
+
+
+def _mvp_label(k):
+    return "past MVP votes" if k == "PRIOR" else LABELS[k]
+
+
+def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
+    """Each eligible player's chance of winning MVP for a season, and his expected share of the vote.
+
+    WIN_CHANCE   chance he wins; adds up to 1 over the season's eligible players
+    SHARE_OF_POINTS  his expected share of all the voting points cast; adds up to 1 over the players
+    ACTUAL_SHARE / FINISH   what happened, for seasons already voted on
+    TEAM_RANK    his team's record among all teams
+    WHY / WHY_NOT  the stats pushing him up and down the most
+    RATING_RANK  where the impact model has him, for contrast
+
+    Players who can no longer reach 65 games are left out (from 2023-24).
+    Early in a season this is "if the vote were today", on per-game numbers
+    and records so far, with games projected to the end of the schedule. The
+    chances don't know how much a season can still change: in November they
+    are far too sure of themselves.
+    """
+    pool, Z = _mvp_frame(df_master, rating_model)
+    here = (pool["SEASON"] == season).to_numpy()
+    if not here.any():
+        raise ValueError(f"no rotation players for {season}")
+    rank_all = pool.loc[here, "RATING"].rank(ascending=False).astype(int)
+    keep = here & pool["ELIGIBLE"].to_numpy()
+    pool, Z = pool[keep], Z[keep]
+    pull = Z * voters.weights.reindex(Z.columns)
+    score = pull.sum(axis=1).to_numpy()
+    reasons = lambda row, sign: ", ".join(_mvp_label(k) for k, v in (row * sign).nlargest(2).items() if v > 0.15)
+    out = pd.DataFrame({
+        "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
+        "PTS": pool["PTS"], "REB": pool["REB"], "AST": pool["AST"], "W_PCT": pool["W_PCT"],
+        "TEAM_RANK": pool["TEAM_RANK"].astype(int),
+        "WIN_CHANCE": _softmax(voters.temperature * score), "SHARE_OF_POINTS": _softmax(score),
+        "RATING_RANK": rank_all.reindex(pool.index),
+        "WHY": [reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [reasons(r, -1) for _, r in pull.iterrows()],
+    }, index=pool.index)
+    if pool["DECIDED"].any():
+        out.insert(10, "ACTUAL_SHARE", pool["SHARE"])
+        out.insert(11, "FINISH", pool["FINISH"])
+    out = out.sort_values("WIN_CHANCE", ascending=False).reset_index(drop=True)
+    out.insert(0, "RANK", np.arange(1, len(out) + 1))
+    out.attrs.update(season=season, n=len(out))
     return out.head(top) if top else out
