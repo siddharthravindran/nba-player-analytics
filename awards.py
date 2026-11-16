@@ -284,7 +284,11 @@ def _voter_table(df_master, rating_model, award="nba"):
 
     # this season against his last real season (20+ games): last season, or the one before if he barely played
     # (Ty Jerome 2026-27: 15 games in 2025-26, so 2024-25 is the baseline). UP_PTS and so on.
-    seasons = table[["PLAYER_ID", "yr", "GP"] + _CHANGES].apply(lambda c: pd.to_numeric(c, errors="coerce") if c.name != "PLAYER_ID" else c)
+    # every season in the master, not only the rated ones: a short season can be missing from rank_players
+    every = df.sort_values("GP").drop_duplicates(["PLAYER_ID", "SEASON"], keep="last")
+    every = every.assign(yr=every["SEASON"].str[:4].astype(int))[["PLAYER_ID", "yr", "GP"] + [c for c in _CHANGES if c in df.columns]]
+    every = every.merge(table[["PLAYER_ID", "yr"] + [c for c in _CHANGES if c not in df.columns]], on=["PLAYER_ID", "yr"], how="left")
+    seasons = every[["PLAYER_ID", "yr", "GP"] + _CHANGES].apply(lambda c: pd.to_numeric(c, errors="coerce") if c.name != "PLAYER_ID" else c)
     seasons = seasons[seasons["GP"] >= MIP_PREV_GP].rename(columns={c: f"PREV_{c}" for c in ["GP"] + _CHANGES})
     last = None
     for back in (1, 2):
@@ -295,7 +299,7 @@ def _voter_table(df_master, rating_model, award="nba"):
         table[f"UP_{c}"] = pd.to_numeric(table[c], errors="coerce") - table[f"PREV_{c}"]
     # scoring against his best earlier season, not just last season: voters reward a new level, not a bounce-back
     # (49 of 50 top-five finishers were above their previous best; none of 86 three-point bounce-backs made it)
-    real = table.loc[table["GP"] >= MIP_PREV_GP, ["PLAYER_ID", "yr", "PTS"]].assign(PTS=lambda t: pd.to_numeric(t["PTS"], errors="coerce"))
+    real = every.loc[every["GP"] >= MIP_PREV_GP, ["PLAYER_ID", "yr", "PTS"]].assign(PTS=lambda t: pd.to_numeric(t["PTS"], errors="coerce"))
     then = table[["PLAYER_ID", "yr"]].reset_index().merge(real, on="PLAYER_ID", suffixes=("", "_then"))
     table["BEST_PTS"] = then[then["yr_then"] < then["yr"]].groupby("index")["PTS"].max().reindex(table.index)
     table["OVER_BEST_PTS"] = (pd.to_numeric(table["PTS"], errors="coerce") - table["BEST_PTS"]).fillna(table["UP_PTS"])
