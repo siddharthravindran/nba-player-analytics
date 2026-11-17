@@ -36,8 +36,15 @@ from nba_viz_utils import (INDEX_COLS, SALARY_CAP, SEASONS, attach_salaries, bui
 __all__ = ["score_market", "this_season", "contracts_vs_market", "market_ahead"]
 
 CURRENT = max(SEASONS)
-MODELS = {"box": ("data/salary_model_v2.txt", "data/feats_v2.json"),
-          "lebron": ("data/salary_model_v2_lebron.txt", "data/feats_v2_lebron.json")}
+VERSIONS = {
+    # v2: the notebook's models. Undrafted players have no EXPERIENCE (it is counted from draft year).
+    "v2": {"box": ("data/salary_model_v2.txt", "data/feats_v2.json"),
+           "lebron": ("data/salary_model_v2_lebron.txt", "data/feats_v2_lebron.json")},
+    # v3: retrained the same way, with undrafted players' EXPERIENCE counted from their first NBA season.
+    "v3": {"box": ("data/salary_model_v3.txt", "data/feats_v2.json"),
+           "lebron": ("data/salary_model_v3_lebron.txt", "data/feats_v2_lebron.json")},
+}
+MODELS = VERSIONS["v2"]
 SALARY_FILE = "data/bbref_salaries_2015-2027.csv"
 CAP_GROWTH = 0.07
 MIN_PCT_CAP = 0.008                       # roughly a minimum contract, as a share of the cap
@@ -89,14 +96,26 @@ def _all_nba(model):
     return model
 
 
-def score_market(df_master, verbose=True):
+def _debut_years():
+    """Each player's first NBA season (start year), from the NBA's all-players list: {PLAYER_ID (str): year}."""
+    from nba_viz_utils import cached_fetch
+    from nba_api.stats.endpoints import CommonAllPlayers
+    p = cached_fetch("common_all_players", lambda: CommonAllPlayers(is_only_current_season=0, league_id="00",
+                                                                    timeout=60).get_data_frames()[0])
+    return dict(zip(p["PERSON_ID"].astype(str), pd.to_numeric(p["FROM_YEAR"], errors="coerce")))
+
+
+def score_market(df_master, version="v3", verbose=True):
     """Every scoreable player-season with the market rate from both saved models: MARKET_BOX / MARKET_LEBRON (share of cap).
 
     Scoreable as in the notebook: a salary, 20+ games (this season: on pace)
     and 10+ minutes; this season also needs MIN_GP_NOW real games.
+    version "v3" (default) counts undrafted players' experience from their first
+    NBA season and scores with the v3 models; "v2" reproduces the notebook/app.
     """
     t0 = time.time()
-    feats = {k: json.load(open(f)) for k, (_, f) in MODELS.items()}
+    models = VERSIONS[version]
+    feats = {k: json.load(open(f)) for k, (_, f) in models.items()}
     model = build_model_table(df_master)
     now = model["SEASON"] == CURRENT
     totals = _season_totals(model, sorted(set(feats["box"]) | set(feats["lebron"])))
@@ -113,6 +132,10 @@ def score_market(df_master, verbose=True):
     model = model.drop(columns=["DRAFT_POSITION", "DRAFT_YR"], errors="ignore").merge(bio, on="PLAYER_ID", how="left")
     model["IS_UNDRAFTED"] = model["DRAFT_POSITION"].isna().astype(int)
     model["EXPERIENCE"] = (model["SEASON"].str[:4].astype(int) - model["DRAFT_YR"]).clip(lower=0)
+    if version != "v2":                                  # undrafted: count from the first NBA season instead
+        debut = model["PLAYER_ID"].map(_debut_years())
+        missing = model["EXPERIENCE"].isna()
+        model.loc[missing, "EXPERIENCE"] = (model["SEASON"].str[:4].astype(int) - debut)[missing].clip(lower=0)
     model["MAX_PCT_ELIGIBLE"] = model["EXPERIENCE"].map(
         lambda e: np.nan if pd.isna(e) else (0.25 if e <= 6 else 0.30 if e <= 9 else 0.35))
     model["pct_cap"] = model["Salary"] / model["SEASON"].map(SALARY_CAP)
@@ -140,13 +163,16 @@ def score_market(df_master, verbose=True):
         mdf = lag_and_encode_lebron(merge_lebron(mdf, load_lebron_seasons("data")))
     mdf = mdf.reset_index(drop=True)
     mdf["index"] = mdf.index                       # the saved models carry a leftover 'index' input (it has no weight)
-    for k, (path, _) in MODELS.items():
-        X = mdf.reindex(columns=feats[k]).apply(pd.to_numeric, errors="coerce")
-        mdf[f"MARKET_{k.upper()}"] = lgb.Booster(model_file=path).predict(X)
+    import os
+    for k, (path, _) in models.items():
+        if os.path.exists(path):
+            X = mdf.reindex(columns=feats[k]).apply(pd.to_numeric, errors="coerce")
+            mdf[f"MARKET_{k.upper()}"] = lgb.Booster(model_file=path).predict(X)
     if verbose:
         print(f"Market model scored {len(mdf)} player-seasons ({int((mdf['SEASON'] == CURRENT).sum())} this season) "
               f"in {time.time() - t0:.0f}s; on an 82-game pace this season: {sorted(set(totals) | {'GP_rs'})}")
     mdf.attrs["paced"] = sorted(set(totals) | {"GP_rs"})
+    mdf.attrs["version"] = version
     return mdf
 
 
@@ -161,14 +187,14 @@ def this_season(scored, season=CURRENT, model="box"):
     return out.sort_values("OVER_M", ascending=False).reset_index(drop=True)
 
 
-def market_ahead(rows, years_ahead, model="box"):
+def market_ahead(rows, years_ahead, model="box", version="v3"):
     """The market rate (share of the cap) for these player-seasons, `years_ahead` seasons on.
 
     Rescored with EXPERIENCE + years_ahead (and its max-contract tier), and
     this season standing in as last season (and the one before), i.e. if he
     keeps playing like this. 0 years ahead is the plain market rate.
     """
-    path, fpath = MODELS[model]
+    path, fpath = VERSIONS[version][model]
     feats = json.load(open(fpath))
     X = rows.reindex(columns=feats).apply(pd.to_numeric, errors="coerce").copy()
     if years_ahead:
@@ -196,7 +222,8 @@ def contracts_vs_market(scored, model="box", cap_growth=CAP_GROWTH, contracts=No
     now = scored[scored["SEASON"] == CURRENT].copy()
     now["name_key"] = now["PLAYER_NAME"].map(norm_name)
     span = int(c["SEASON"].str[:4].astype(int).max()) - int(CURRENT[:4]) + 1
-    rate = pd.DataFrame({k: market_ahead(now, k, model) for k in range(span)})
+    version = scored.attrs.get("version", "v3")
+    rate = pd.DataFrame({k: market_ahead(now, k, model, version) for k in range(span)})
     cap0 = SALARY_CAP[CURRENT]
     rows = []
     for i, p in now.iterrows():
