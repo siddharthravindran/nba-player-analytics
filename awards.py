@@ -99,7 +99,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "fit_allstar_model", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -1052,3 +1052,103 @@ def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
 
 
 _allstar_cache = {}
+
+
+# ---------------------------------------------------------------- history
+AWARD_HISTORY = DATA_DIR / "award_history.parquet"
+AWARD_ORDER = ["MVP", "All-NBA", "All-Star", "All-Defensive", "Most Improved"]
+
+
+def _for_history(df_master, season):
+    """The master as the history measures it: this season's Basketball-Reference stats left out (they were only
+    joined from Nov 13, 2026, so earlier days can't have them), ages kept. Every day is then measured the same way."""
+    df = df_master.copy()
+    now = df.index.get_level_values("SEASON") == season
+    drop = [c for c in df.columns if c.startswith("BBR_") and c != "BBR_AGE"]
+    df.loc[now, drop] = np.nan
+    return df
+
+
+def award_snapshot(df_master, rating_model, season="2026-27", penalties=None):
+    """Every player's chance in every award race today, long format: AWARD, Player, TEAM, GP, CHANCE, RANK.
+
+    Measured the way the history is (_for_history), with no injury absences:
+    there are no old injury reports, so past days couldn't have them either.
+    penalties: {award: penalty} to skip the penalty search (faster; the history
+    backfill passes today's).
+    """
+    pen = penalties or {}
+    saved = dict(KNOWN_ABSENCES)
+    KNOWN_ABSENCES.clear()
+    try:
+        dm = _for_history(df_master, season)
+        nba = fit_allnba_model(dm, rating_model, penalty=pen.get("All-NBA"), verbose=False)
+        star = fit_allstar_model(dm, rating_model, penalty=pen.get("All-Star"), verbose=False)
+        dfn = fit_alldefense_model(dm, rating_model, penalty=pen.get("All-Defensive"), verbose=False)
+        mip = fit_mip_model(dm, rating_model, penalty=pen.get("Most Improved"), verbose=False)
+        mvp = fit_mvp_model(dm, rating_model, penalty=pen.get("MVP"), verbose=False)
+        parts = {
+            "MVP": predict_mvp(mvp, dm, rating_model, season, top=None).rename(columns={"WIN_CHANCE": "CHANCE"}),
+            "All-NBA": predict_allnba(nba, dm, rating_model, season, top=None),
+            "All-Star": predict_allstars(star, dm, rating_model, season, next_up=40),
+            "All-Defensive": pick_all_defense(rating_model, dm, season, top=None, voters=dfn),
+            "Most Improved": predict_mip(mip, dm, rating_model, season, top=None),
+        }
+    finally:
+        KNOWN_ABSENCES.clear()
+        KNOWN_ABSENCES.update(saved)
+    out = []
+    for award, t in parts.items():
+        t = t.sort_values("CHANCE", ascending=False).reset_index(drop=True)
+        out.append(pd.DataFrame({"AWARD": award, "Player": t["Player"], "TEAM": t["TEAM"],
+                                 "GP": t["GP"] if "GP" in t.columns else np.nan, "CHANCE": t["CHANCE"].astype(float),
+                                 "RANK": np.arange(1, len(t) + 1)}))
+    out = pd.concat(out, ignore_index=True)
+    out.attrs["penalties"] = {"All-NBA": nba.penalty, "All-Star": star.penalty, "All-Defensive": dfn.penalty,
+                              "Most Improved": mip.penalty, "MVP": mvp.penalty}
+    return out
+
+
+def save_award_snapshot(df_master, rating_model, date=None, season="2026-27", penalties=None, path=AWARD_HISTORY):
+    """Add today's (or `date`'s) award chances to data/award_history.parquet, replacing that date if it's there."""
+    date = pd.Timestamp(date or pd.Timestamp.today()).normalize()
+    snap = award_snapshot(df_master, rating_model, season, penalties).assign(DATE=date)
+    pens = snap.attrs.get("penalties")
+    full = snap
+    if path.exists():
+        old = pd.read_parquet(path)
+        full = pd.concat([old[old["DATE"] != date], snap], ignore_index=True)
+    full.sort_values(["DATE", "AWARD", "RANK"]).to_parquet(path, index=False)
+    snap.attrs["penalties"] = pens
+    return snap
+
+
+def award_movers(since=None, until=None, award=None, top=8, min_change=0.005, path=AWARD_HISTORY):
+    """Who gained and lost the most in each award race between two saved days.
+
+    since / until: dates (the nearest saved day on or after `since`, on or
+    before `until`); default the first and last saved days. Returns a table per
+    award with CHANCE_THEN, CHANCE_NOW, CHANGE and RANK_THEN -> RANK_NOW, the
+    biggest gainers then the biggest losers. A player missing on one day (not
+    yet in the pool, or dropped out of it: too few games, or hurt) counts as 0
+    there. Changes under `min_change` are left out.
+    """
+    h = pd.read_parquet(path)
+    days = sorted(h["DATE"].unique())
+    d0 = min(d for d in days if since is None or d >= pd.Timestamp(since))
+    d1 = max(d for d in days if until is None or d <= pd.Timestamp(until))
+    out = []
+    for a in ([award] if award else AWARD_ORDER):
+        then = h[(h["DATE"] == d0) & (h["AWARD"] == a)].set_index("Player")
+        now = h[(h["DATE"] == d1) & (h["AWARD"] == a)].set_index("Player")
+        j = now[["TEAM", "CHANCE", "RANK"]].join(then[["CHANCE", "RANK"]], rsuffix="_THEN", how="outer")
+        j["TEAM"] = j["TEAM"].fillna(then["TEAM"].reindex(j.index))
+        j = j.rename(columns={"CHANCE": "CHANCE_NOW", "RANK": "RANK_NOW"}).fillna({"CHANCE_NOW": 0.0, "CHANCE_THEN": 0.0})
+        j["CHANGE"] = j["CHANCE_NOW"] - j["CHANCE_THEN"]
+        up = j[j["CHANGE"] >= min_change].nlargest(top, "CHANGE").assign(DIRECTION="gained")
+        down = j[j["CHANGE"] <= -min_change].nsmallest(top, "CHANGE").assign(DIRECTION="lost")
+        part = pd.concat([up, down]).reset_index().assign(AWARD=a)
+        out.append(part[["AWARD", "DIRECTION", "Player", "TEAM", "CHANCE_THEN", "CHANCE_NOW", "CHANGE", "RANK_THEN", "RANK_NOW"]])
+    res = pd.concat(out, ignore_index=True)
+    res.attrs.update(since=str(pd.Timestamp(d0).date()), until=str(pd.Timestamp(d1).date()))
+    return res
