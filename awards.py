@@ -99,7 +99,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -1152,3 +1152,42 @@ def award_movers(since=None, until=None, award=None, top=8, min_change=0.005, pa
     res = pd.concat(out, ignore_index=True)
     res.attrs.update(since=str(pd.Timestamp(d0).date()), until=str(pd.Timestamp(d1).date()))
     return res
+
+
+def add_absences(df_master, overrides, season="2026-27", today=None):
+    """Your own absence estimates, counted down as the team plays, so they expire on their own.
+
+        add_absences(df_master, {"Duncan Robinson": (4, "2026-11-17")})   # 4 games from Nov 17
+
+    Each entry is (games he'll miss, the date you set it). Games still to miss =
+    games minus his team's games played on or after that date; at 0 the entry
+    has expired and is dropped. Remaining ones go into KNOWN_ABSENCES (after
+    use_injury_report, so they win over it). Returns a table of every entry.
+    """
+    from team_projection import load_games
+    from player_ranking import _regular_season
+    games = load_games(season)
+    cur = _regular_season(df_master)
+    cur = cur[cur["SEASON"] == season].sort_values("GP").drop_duplicates("PLAYER_ID", keep="last")
+    team = dict(zip(cur["PLAYER_NAME"], cur["TEAM_ABBREVIATION"]))
+    rows = []
+    for name, (n, since) in overrides.items():
+        t = team.get(name)
+        if t is None:
+            rows.append({"Player": name, "TEAM": None, "SET": since, "GAMES": n, "PLAYED_SINCE": None, "LEFT": None,
+                         "STATUS": "name not found this season"})
+            continue
+        day = pd.Timestamp(since)
+        played = int((((games["HOME"] == t) | (games["AWAY"] == t)) & (games["DATE"] >= day)).sum())
+        left = max(n - played, 0)
+        rows.append({"Player": name, "TEAM": t, "SET": since, "GAMES": n, "PLAYED_SINCE": played, "LEFT": left,
+                     "STATUS": "out" if left else "expired: delete this line"})
+        if left:
+            KNOWN_ABSENCES[name] = left
+        else:
+            KNOWN_ABSENCES.pop(name, None)       # the report may still list him; your read says he's back
+    out = pd.DataFrame(rows)
+    done = out.loc[out["STATUS"] != "out", "Player"].tolist()
+    if done:
+        print(f"⚠️ expired or not found, delete from the cell: {done}")
+    return out
