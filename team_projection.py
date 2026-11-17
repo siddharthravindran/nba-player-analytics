@@ -66,6 +66,9 @@ USUAL_AVAILABILITY = 0.82                      # share of games the typical rota
 AVAILABILITY_SEASONS = (0.5, 0.3, 0.2)         # weights on the last three seasons' share of games played
 AVAILABILITY_PRIOR = 0.5                       # the usual rate counts like half a season against his own history
 ROTATION_MPG = 20                              # rotation players' minutes going forward: minutes per game x availability
+TEAM_MINUTES = 240
+STARTERS = 5                                   # minutes freed up go to the bench (players 6 and down) first
+MAX_MPG = 36                                   # nobody is pushed past this to fill minutes
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
 
@@ -365,9 +368,44 @@ def fit_projection(df_master=None, rating_model=None, verbose=True, cutoff_now=N
     return Projection(pg, c, sigma, scale, final, check, w, ratings)
 
 
+def _allocate(wanted):
+    """Minutes per game for each player, summing to TEAM_MINUTES, from the minutes each would normally play.
+
+    Bench first, as coaches do: with too many minutes (someone added), the
+    deepest bench loses them first; with too few (someone out), the bench
+    (players STARTERS+1 and down, most-used first) picks them up, up to MAX_MPG,
+    then anyone left with room.
+    """
+    m = np.asarray(wanted, float).copy()
+    order = np.argsort(-m)                                      # biggest role first
+    excess = m.sum() - TEAM_MINUTES
+    if excess > 0:
+        for i in order[::-1]:                                   # deepest bench gives up minutes first
+            cut = min(m[i], excess)
+            m[i] -= cut
+            excess -= cut
+            if excess <= 1e-9:
+                break
+    elif excess < 0:
+        need = -excess
+        for group in (order[STARTERS:], order[:STARTERS]):      # the bench picks them up, then the starters
+            for i in group:
+                add = min(MAX_MPG - m[i], need) if m[i] < MAX_MPG else 0.0
+                m[i] += add
+                need -= add
+                if need <= 1e-9:
+                    return m
+        if need > 1e-9:                                         # not enough players under the cap: spread the rest
+            m += need * m / m.sum()
+    return m
+
+
 def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, team_gp, moves=None):
     """Per remaining game, each side's change in strength from who is available, against the lineup so far.
 
+    Minutes are then fitted to TEAM_MINUTES bench first (_allocate): a player
+    who is out hands his minutes to the bench, a player added takes them from
+    the deepest bench, rather than everyone's minutes moving in proportion.
     A rotation player's share going forward (ROTATION_MPG+ when he plays) is
     his minutes per game x his expected availability (_availability: his last
     three seasons' games played, pulled toward the usual rate), so a player who
@@ -398,7 +436,10 @@ def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw,
 
     def strength(team, j):
         t = roster[(roster["TEAM"] == team) & (roster["OUT"] <= j)]
-        return float((t["R"] * t["MPG"]).sum() / t["MPG"].sum() * 5) if len(t) else np.nan
+        if not len(t):
+            return np.nan
+        m = _allocate(t["MPG"].to_numpy(float))
+        return float((t["R"].to_numpy() * m).sum() / m.sum() * 5)
 
     cache = {}
     vals = []
