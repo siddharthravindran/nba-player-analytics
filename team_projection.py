@@ -365,7 +365,7 @@ def fit_projection(df_master=None, rating_model=None, verbose=True, cutoff_now=N
     return Projection(pg, c, sigma, scale, final, check, w, ratings)
 
 
-def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, team_gp):
+def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, team_gp, moves=None):
     """Per remaining game, each side's change in strength from who is available, against the lineup so far.
 
     A rotation player's share going forward (ROTATION_MPG+ when he plays) is
@@ -388,7 +388,8 @@ def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw,
     tgp = cur["TEAM_ABBREVIATION"].map(team_gp).clip(lower=1).to_numpy(float)
     so_far = cur["MIN"].to_numpy(float) * cur["GP"].to_numpy(float) / tgp           # minutes per team game so far
     share = np.where(mpg >= ROTATION_MPG, mpg * avail, so_far)
-    roster = pd.DataFrame({"TEAM": cur["TEAM_ABBREVIATION"].to_numpy(), "NAME": cur["PLAYER_NAME"].to_numpy(),
+    team_now = cur["PLAYER_NAME"].map(moves or {}).fillna(cur["TEAM_ABBREVIATION"]).to_numpy()   # trades: who plays where from now on
+    roster = pd.DataFrame({"TEAM": team_now, "NAME": cur["PLAYER_NAME"].to_numpy(),
                            "R": rating, "MPG": share, "AVAIL": avail, "OUT": cur["PLAYER_NAME"].map(absences or {}).fillna(0).to_numpy()})
     long = pd.concat([pd.DataFrame({"G": np.arange(len(rest)), "T": rest["HOME"].to_numpy(), "SIDE": "H", "DATE": rest["DATE"].to_numpy()}),
                       pd.DataFrame({"G": np.arange(len(rest)), "T": rest["AWAY"].to_numpy(), "SIDE": "A", "DATE": rest["DATE"].to_numpy()})])
@@ -416,7 +417,7 @@ def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw,
     return (ha, aa, end), avg
 
 
-def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=None, return_sims=False):
+def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=None, return_sims=False, moves=None):
     """This season: wins so far, expected final wins, an 80% range, and the chance of the top 6 / top 10 in the conference.
 
     PLAYOFFS adds the play-in: seeds 7-10 play it out (7 hosts 8, 9 hosts 10, the
@@ -427,6 +428,8 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     adjusts each remaining game. LINEUP_ADJ is the average adjustment over the
     remaining games, in points: negative for a team with players out or prone
     to missing games, positive for one getting players back.
+    moves: {player name: new team} to try a trade: he plays for the new team in
+    every remaining game (the games already played stay where they were).
     """
     played = load_games(season)
     teams = sorted(proj.final[SEASONS[-2]].index)
@@ -445,7 +448,7 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     rest = _remaining_schedule(season)
     adj, lineup = (None, pd.Series(0.0, index=teams))
     if use_players:
-        adj, lineup = _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, gp)
+        adj, lineup = _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, gp, moves)
     sd = pd.Series(proj.sd_scale * proj.sigma / np.sqrt(n + proj.prior_games), index=teams)
     scheduled = gp + rest["HOME"].value_counts().add(rest["AWAY"].value_counts(), fill_value=0).reindex(teams).fillna(0)
     unscheduled = (SEASON_GAMES - scheduled).clip(lower=0)
