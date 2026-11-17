@@ -10,7 +10,8 @@
 What a slot is worth: for every draft in DRAFTS, each pick's surplus over his
 first CONTROL_YEARS seasons (the rookie deal): wins (player_ranking) x the
 price of a win (trade_value.price_of_a_win: what teams pay veterans per win)
-minus his salary, as a share of the cap. A pick who never plays is worth 0.
+minus his salary, as a share of the cap, plus the title odds he adds as in
+trade_value (TITLE_VALUE). A pick who never plays is worth 0.
 Averaged by slot and smoothed so value never rises with a later pick.
 
 Which slot a team will get: this season's projection (team_projection) plays
@@ -51,7 +52,7 @@ def _draft_history():
     return d
 
 
-def slot_values(model, df_master, drafts=DRAFTS, years=CONTROL_YEARS, price=None, verbose=True):
+def slot_values(model, df_master, drafts=DRAFTS, years=CONTROL_YEARS, price=None, verbose=True, title_value=None, title_odds=None):
     """What each pick slot (1-60) has been worth: surplus over the first `years` seasons, as a share of the cap.
 
     Columns: RAW (that slot's average), VALUE (smoothed, never rising with a
@@ -60,13 +61,22 @@ def slot_values(model, df_master, drafts=DRAFTS, years=CONTROL_YEARS, price=None
     from sklearn.isotonic import IsotonicRegression
     from player_ranking import rank_players
     from salaries import load_salaries
-    from trade_value import price_of_a_win
+    from trade_value import TITLE_VALUE, _title_gain, fit_title_odds, price_of_a_win
+    title_value = TITLE_VALUE if title_value is None else title_value
     with contextlib.redirect_stdout(io.StringIO()):
         price = price_of_a_win(model, df_master) if price is None else price
+        beta, field = (title_odds or fit_title_odds()) if title_value else (None, None)
+        _, replacement = model.war
         wins = {}
         for s in SEASONS[:-1]:
-            r = rank_players(model, df_master, s, min_min=0, min_gp=0)
-            wins[s] = r.assign(PID=r["PLAYER_ID"].astype(int)).groupby("PID")["WINS"].sum()
+            r = rank_players(model, df_master, s, min_min=0, min_gp=0).assign(PID=lambda t: t["PLAYER_ID"].astype(int))
+            g = r.groupby("PID")
+            value = g["WINS"].sum() * price                               # wins, as a share of the cap
+            if title_value:                                               # plus the title odds he adds (as in trade_value)
+                pts = ((r["RATING"] + replacement).clip(lower=0) * r["MIN"] / 48)
+                gain = _title_gain(pts.to_numpy(), beta, field) * (r["GP"] / 82).clip(upper=1).to_numpy() * title_value
+                value = value + pd.Series(gain, index=r.index).groupby(r["PID"]).sum()
+            wins[s] = value
         pay = load_salaries(save=False)
     paid = pay.set_index(["name_key", "SEASON"])["pct_cap"]
     dh = _draft_history()
@@ -78,9 +88,9 @@ def slot_values(model, df_master, drafts=DRAFTS, years=CONTROL_YEARS, price=None
             s = f"{p['SEASON'] + k}-{str(p['SEASON'] + k + 1)[2:]}"
             if s not in wins:
                 continue
-            w = float(wins[s].get(int(p["PERSON_ID"]), 0.0))
+            w = float(wins[s].get(int(p["PERSON_ID"]), 0.0))             # already priced, share of the cap
             cost = float(paid.get((norm_name(p["PLAYER_NAME"]), s), 0.0)) if w else 0.0
-            total += max(w, 0.0) * price - cost
+            total += max(w, 0.0) - cost
         rows.append({"PICK": int(p["OVERALL_PICK"]), "DRAFT": p["SEASON"], "Player": p["PLAYER_NAME"], "SURPLUS": total})
     picks = pd.DataFrame(rows)
     g = picks.groupby("PICK")["SURPLUS"]
@@ -89,7 +99,7 @@ def slot_values(model, df_master, drafts=DRAFTS, years=CONTROL_YEARS, price=None
     smooth = curve["RAW"].rolling(5, center=True, min_periods=1).mean()
     iso = IsotonicRegression(increasing=False).fit(smooth.index, smooth.fillna(smooth.mean()), sample_weight=curve["N"].fillna(1))
     curve["VALUE"] = iso.predict(curve.index)
-    curve.attrs.update(price=price, drafts=f"{min(drafts)}-{max(drafts)}", years=years, picks=picks)
+    curve.attrs.update(price=price, drafts=f"{min(drafts)}-{max(drafts)}", years=years, picks=picks, title_value=title_value)
     if verbose:
         cap = SALARY_CAP[CURRENT]
         print(f"Pick values from the {min(drafts)}-{max(drafts)} drafts, surplus over {years} seasons "
