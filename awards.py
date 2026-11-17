@@ -41,7 +41,7 @@ import numpy as np
 import pandas as pd
 from sklearn.linear_model import LogisticRegression
 
-from bbref_stats import DATA_DIR, _get, fetch_injuries
+from bbref_stats import DATA_DIR, _get, fetch_injuries, fetch_mvp_tracker
 from nba_viz_utils import SEASONS, norm_name
 from player_ranking import _regular_season, rank_players
 from salaries import ALLNBA_WEIGHT, _allnba_selections
@@ -891,7 +891,19 @@ def _mvp_label(k):
     return "past MVP votes" if k == "PRIOR" else LABELS[k]
 
 
-def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
+def _tracker(season):
+    """Basketball-Reference's MVP tracker by name_key, or None (past season, or the fetch failed)."""
+    if season != max(SEASONS):
+        return None
+    try:
+        t = fetch_mvp_tracker()
+    except Exception as e:
+        print(f"⚠️ Basketball-Reference MVP tracker not available ({type(e).__name__}: {e})")
+        return None
+    return t.assign(name_key=t["Player"].map(norm_name)).set_index("name_key")["TRACKER_PROB"]
+
+
+def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15, tracker=True):
     """Each eligible player's chance of winning MVP for a season, and his expected share of the vote.
 
     WIN_CHANCE   chance he wins; adds up to 1, and counts his chance of reaching 65 games (REACH_65)
@@ -900,6 +912,8 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
     TEAM_RANK    his team's record among all teams
     WHY / WHY_NOT  the stats pushing him up and down the most
     RATING_RANK  where the impact model has him, for contrast
+    TRACKER_PROB Basketball-Reference's MVP tracker (their own model), this season
+                 only: a second opinion to compare against, not an input
 
     Players who can no longer reach 65 games are left out (from 2023-24).
     Early in a season this is "if the vote were today", on per-game numbers
@@ -930,6 +944,10 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15):
     if pool["DECIDED"].any():
         out.insert(10, "ACTUAL_SHARE", pool["SHARE"])
         out.insert(11, "FINISH", pool["FINISH"])
+    tr = _tracker(season) if tracker else None
+    if tr is not None:
+        out.insert(out.columns.get_loc("SHARE_OF_POINTS") + 1, "TRACKER_PROB",
+                   out["Player"].map(norm_name).map(tr).fillna(0.0).to_numpy())
     out = out.sort_values("WIN_CHANCE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out))
@@ -1056,7 +1074,7 @@ _allstar_cache = {}
 
 # ---------------------------------------------------------------- history
 AWARD_HISTORY = DATA_DIR / "award_history.parquet"
-AWARD_ORDER = ["MVP", "All-NBA", "All-Star", "All-Defensive", "Most Improved"]
+AWARD_ORDER = ["MVP", "MVP (B-Ref tracker)", "All-NBA", "All-Star", "All-Defensive", "Most Improved"]
 
 
 def _for_history(df_master, season):
@@ -1103,6 +1121,11 @@ def award_snapshot(df_master, rating_model, season="2026-27", penalties=None):
         out.append(pd.DataFrame({"AWARD": award, "Player": t["Player"], "TEAM": t["TEAM"],
                                  "GP": t["GP"] if "GP" in t.columns else np.nan, "CHANCE": t["CHANCE"].astype(float),
                                  "RANK": np.arange(1, len(t) + 1)}))
+    tr = _tracker(season)                                 # saved alongside, for the season-end comparison
+    if tr is not None:
+        m = parts["MVP"][["Player", "TEAM", "GP"]].assign(CHANCE=lambda t: t["Player"].map(norm_name).map(tr).fillna(0.0))
+        m = m.sort_values("CHANCE", ascending=False).reset_index(drop=True)
+        out.append(m.assign(AWARD="MVP (B-Ref tracker)", RANK=np.arange(1, len(m) + 1))[["AWARD", "Player", "TEAM", "GP", "CHANCE", "RANK"]])
     out = pd.concat(out, ignore_index=True)
     out.attrs["penalties"] = {"All-NBA": nba.penalty, "All-Star": star.penalty, "All-Defensive": dfn.penalty,
                               "Most Improved": mip.penalty, "MVP": mvp.penalty}
@@ -1138,7 +1161,7 @@ def award_movers(since=None, until=None, award=None, top=8, min_change=0.005, pa
     d0 = min(d for d in days if since is None or d >= pd.Timestamp(since))
     d1 = max(d for d in days if until is None or d <= pd.Timestamp(until))
     out = []
-    for a in ([award] if award else AWARD_ORDER):
+    for a in ([award] if award else [x for x in AWARD_ORDER if x in set(h["AWARD"])]):
         then = h[(h["DATE"] == d0) & (h["AWARD"] == a)].set_index("Player")
         now = h[(h["DATE"] == d1) & (h["AWARD"] == a)].set_index("Player")
         j = now[["TEAM", "CHANCE", "RANK"]].join(then[["CHANCE", "RANK"]], rsuffix="_THEN", how="outer")

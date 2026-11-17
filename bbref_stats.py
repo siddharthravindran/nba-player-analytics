@@ -347,6 +347,29 @@ def fetch_injuries(force=False, max_age_hours=6):
     return df
 
 
+def fetch_mvp_tracker(force=False, max_age_hours=6):
+    """Basketball-Reference's MVP Award Tracker for the season in progress: Player, Team, TRACKER_PROB (0-1).
+
+    Their own model's chance of winning; the page shows the current season only.
+    Cached for six hours.
+    """
+    from io import StringIO
+    cache = DATA_DIR / "bbref_mvp_tracker.parquet"
+    if cache.exists() and not force and (time.time() - cache.stat().st_mtime) < max_age_hours * 3600:
+        return pd.read_parquet(cache)
+    html = _get(f"{BASE}/friv/mvp.html")
+    at = html.find('id="players"')
+    if at < 0:
+        raise ValueError("MVP tracker table not found")
+    t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+    t.columns = [c[-1] if isinstance(c, tuple) else c for c in t.columns]
+    t = t[t["Rk"].astype(str).str.isdigit()]
+    out = pd.DataFrame({"Player": t["Player"], "Team": t["Team"],
+                        "TRACKER_PROB": pd.to_numeric(t["Prob%"].astype(str).str.rstrip("%"), errors="coerce") / 100})
+    out.to_parquet(cache, index=False)
+    return out
+
+
 def fetch_contracts(force=False, max_age_days=7):
     """This season's salaries. Cached for a week — contracts change with trades and signings."""
     cache = DATA_DIR / "bbref_contracts_current.parquet"
