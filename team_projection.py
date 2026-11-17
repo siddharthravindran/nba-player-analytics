@@ -1,6 +1,7 @@
 """Where will every team finish? Final records from point margins and the schedule still to play.
 
     from team_projection import *
+    proj = load_or_fit_projection(df_master, model)   # the saved fit, refitted when a week old (a fit takes ~6 minutes)
     proj = fit_projection(df_master, model)       # fits on past seasons, prints how it would have done
     project_season(proj, df_master, absences=KNOWN_ABSENCES)   # this season, with known injuries
     proj.check                                    # every past season frozen at the same point, vs what happened
@@ -45,7 +46,7 @@ from scipy.stats import norm
 
 from nba_viz_utils import cached_fetch
 
-__all__ = ["fit_projection", "project_season", "load_games", "player_ratings"]
+__all__ = ["fit_projection", "load_or_fit_projection", "project_season", "load_games", "player_ratings"]
 
 SEASONS = [f"{y}-{str(y + 1)[2:]}" for y in range(2015, 2027)]
 CURRENT = SEASONS[-1]
@@ -464,3 +465,24 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     out = out.sort_values(["CONF", "PROJ_W"], ascending=[True, False]).reset_index(drop=True)
     out.attrs.update(season=season, home_court=round(h, 2), remaining=len(rest))
     return out
+
+
+def load_or_fit_projection(df_master, rating_model, max_age_days=7, refit=False):
+    """The saved fit (data/team_projection_fit.pkl), refitted when older than `max_age_days` or with refit=True.
+
+    The fit only learns from past seasons, so it barely changes week to week;
+    project_season always uses today's games, schedule and absences.
+    """
+    import pickle
+    from nba_viz_utils import DATA_DIR
+    path = DATA_DIR / "team_projection_fit.pkl"
+    if path.exists() and not refit and (time.time() - path.stat().st_mtime) < max_age_days * 86400:
+        with open(path, "rb") as f:
+            proj = pickle.load(f)
+        print(f"📂 Season projection fit from {time.strftime('%b %d', time.localtime(path.stat().st_mtime))} "
+              f"(refit=True to redo); past-season check: {proj.check.drop(columns='IN_80_RANGE').mean().round(1).to_dict()}")
+        return proj
+    proj = fit_projection(df_master, rating_model)
+    with open(path, "wb") as f:
+        pickle.dump(proj, f)
+    return proj
