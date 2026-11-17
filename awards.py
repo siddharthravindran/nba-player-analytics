@@ -947,7 +947,8 @@ _DURATION = re.compile(r"(\d+|" + "|".join(sorted(_NUMBERS, key=len, reverse=Tru
 def _games_out(row, today, left):
     """Games still to miss from one injury-report line: (games, how it was read)."""
     text = str(row["Description"])
-    if text.lower().startswith("out for season"):
+    if text.lower().startswith("out for season") or re.search(
+            r"(?:end|rest|remainder) of the (?:regular )?season|season-ending|miss the (?:20\d\d-\d\d )?season", text, re.I):
         return left, "out for season"
     if not text.lower().startswith("out"):
         return 0.0, "day to day"
