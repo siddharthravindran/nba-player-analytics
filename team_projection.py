@@ -419,6 +419,9 @@ def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw,
 def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=None):
     """This season: wins so far, expected final wins, an 80% range, and the chance of the top 6 / top 10 in the conference.
 
+    PLAYOFFS adds the play-in: seeds 7-10 play it out (7 hosts 8, 9 hosts 10, the
+    7/8 loser hosts the 9/10 winner), each game won by rating and home court.
+
     With df_master (and a proj fitted with players), the prior uses the roster
     and `absences` ({player name: games still to miss}, e.g. KNOWN_ABSENCES)
     adjusts each remaining game. LINEUP_ADJ is the average adjustment over the
@@ -449,18 +452,33 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     sim = _simulate(rest, r, h, proj.sigma, sd, teams, wins_now, sims=sims, unscheduled=unscheduled.to_numpy(), adj=adj)
     conf = np.array(["East" if t in EAST else "West" for t in teams])
     seed = np.zeros_like(sim)
-    noise = np.random.default_rng(2).random(sim.shape) * 1e-3                   # random tie-breaks
+    playoffs = np.zeros_like(sim, dtype=bool)
+    rng = np.random.default_rng(3)
+    noise = rng.random(sim.shape) * 1e-3                                       # random tie-breaks
+    strength = r.to_numpy() + (adj[2] if adj is not None else 0.0)             # end-of-season lineup
+    rows = np.arange(len(sim))
     for cf in ("East", "West"):
         cols = np.flatnonzero(conf == cf)
         order = np.argsort(-(sim[:, cols] + noise[:, cols]), axis=1)
         ranks = np.empty_like(order)
         np.put_along_axis(ranks, order, np.arange(1, len(cols) + 1)[None, :].repeat(len(sim), 0), axis=1)
         seed[:, cols] = ranks
+        # play-in: 7 hosts 8 (winner is the 7 seed); 9 hosts 10; 7/8 loser hosts 9/10 winner for the 8 seed
+        s7, s8, s9, s10 = (cols[order[:, k]] for k in (6, 7, 8, 9))
+        game = lambda home, away: rng.random(len(sim)) < norm.cdf((h + strength[home] - strength[away]) / proj.sigma)
+        w1 = game(s7, s8)
+        win1, lose1 = np.where(w1, s7, s8), np.where(w1, s8, s7)
+        w2 = np.where(game(s9, s10), s9, s10)
+        win3 = np.where(game(lose1, w2), lose1, w2)
+        playoffs[:, cols] = seed[:, cols] <= 6
+        playoffs[rows, win1] = True
+        playoffs[rows, win3] = True
     out = pd.DataFrame({
         "TEAM": teams, "CONF": conf, "W": wins_now.astype(int).to_numpy(), "L": (gp - wins_now).astype(int).to_numpy(),
         "RATING": r.round(1).to_numpy(), "LINEUP_ADJ": lineup.round(1).to_numpy(), "PROJ_W": sim.mean(axis=0).round(1),
         "LOW_80": np.percentile(sim, 10, axis=0).round(0).astype(int), "HIGH_80": np.percentile(sim, 90, axis=0).round(0).astype(int),
         "UNSCHEDULED": unscheduled.astype(int).to_numpy(), "TOP_6": (seed <= 6).mean(axis=0).round(2), "TOP_10": (seed <= 10).mean(axis=0).round(2),
+        "PLAYOFFS": playoffs.mean(axis=0).round(2),
     })
     out = out.sort_values(["CONF", "PROJ_W"], ascending=[True, False]).reset_index(drop=True)
     out.attrs.update(season=season, home_court=round(h, 2), remaining=len(rest))
