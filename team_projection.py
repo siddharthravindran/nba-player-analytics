@@ -17,10 +17,14 @@ How it works
     too. How hard to pull (the prior counts like PRIOR_GAMES games), the weight
     on the roster and the carry-over are fitted on past seasons, frozen at the
     same point, by how well each would have predicted the final records.
-  - Known absences (project_season's `absences`, e.g. KNOWN_ABSENCES from
-    awards.py: games still to miss) move a team's strength game by game: his
-    minutes go to teammates for that stretch, and the change in roster strength
-    is applied at the weight fitted above. This part can't be tested on past
+  - Going forward each player is expected to play his usual minutes x his
+    availability (his last three seasons' share of games, pulled toward the
+    usual 82%): an iron man counts more than a player who misses a third of
+    every season. Known absences (project_season's `absences`, e.g.
+    KNOWN_ABSENCES from awards.py: games still to miss) take him out for that
+    stretch. Minutes go to teammates, and the change in roster strength is
+    applied at the weight fitted above. Rookies' ratings come from this
+    season once they have games (ROOKIE_GAMES). This part can't be tested on past
     seasons (there are no old injury reports), so treat it as a reasoned
     adjustment, not a measured one.
   - Every remaining game gets a home win chance from the two ratings, home
@@ -56,8 +60,11 @@ CARRY_WITH_ROSTER = (0.0, 0.2, 0.4, 0.6)
 ROOKIE_RATING = -1.5                           # a player with no reliable past season: below average, a judgment
 RELIABLE_MIN = 500                             # minutes in a season before his rating there is used
 SETTLED_GP = 5                                 # games this season before his minutes per game are trusted
-ROTATION_MPG = 20                              # a rotation player who has missed games is assumed hurt, and back after
-AVAILABILITY = 0.85                            # share of games a healthy rotation player plays
+ROOKIE_GAMES = 10                              # a new player's own rating this season counts like this many games against ROOKIE_RATING
+USUAL_AVAILABILITY = 0.82                      # share of games the typical rotation player plays
+AVAILABILITY_SEASONS = (0.5, 0.3, 0.2)         # weights on the last three seasons' share of games played
+AVAILABILITY_PRIOR = 0.5                       # the usual rate counts like half a season against his own history
+ROTATION_MPG = 20                              # rotation players' minutes going forward: minutes per game x availability
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
 
@@ -156,16 +163,44 @@ def player_ratings(df_master, rating_model):
     return out
 
 
-def _known_rating(pids, season, ratings):
-    """Each player's rating going into `season`: last season, else the one before, else ROOKIE_RATING."""
+def _known_rating(pids, season, ratings, current=False):
+    """Each player's rating going into `season`: last season, else the one before, else ROOKIE_RATING.
+
+    current=True (this season's projection only, never the backtest): a player
+    with no reliable past season gets his own rating this season, weighed
+    against ROOKIE_RATING by games: after 10 games it is half his own.
+    """
     vals = pd.Series(ROOKIE_RATING, index=pd.Index(pids, dtype=int), dtype=float)
+    known = pd.Series(False, index=vals.index)
     i = SEASONS.index(season)
     for back in (2, 1):                                   # the nearer season wins
         if i - back >= 0 and SEASONS[i - back] in ratings:
             r = ratings[SEASONS[i - back]]
-            r = r[r["MINUTES"] >= RELIABLE_MIN]["RATING"]
-            vals.update(r.reindex(vals.index).dropna())
+            r = r[r["MINUTES"] >= RELIABLE_MIN]["RATING"].reindex(vals.index).dropna()
+            vals.update(r)
+            known[r.index] = True
+    if current and season in ratings:
+        now = ratings[season].reindex(vals.index)
+        new = ~known & now["RATING"].notna()
+        gp = now.loc[new, "GP"]
+        vals[new] = (gp * now.loc[new, "RATING"] + ROOKIE_GAMES * ROOKIE_RATING) / (gp + ROOKIE_GAMES)
     return vals
+
+
+def _availability(pids, season, ratings):
+    """Share of games each player is expected to play: his last three seasons, pulled toward the usual rate."""
+    i = SEASONS.index(season)
+    num = pd.Series(AVAILABILITY_PRIOR * USUAL_AVAILABILITY, index=pd.Index(pids, dtype=int))
+    den = pd.Series(AVAILABILITY_PRIOR, index=num.index)
+    for back, w in zip((1, 2, 3), AVAILABILITY_SEASONS):
+        if i - back < 0 or SEASONS[i - back] not in ratings:
+            continue
+        r = ratings[SEASONS[i - back]]
+        share = (r["GP"] / r["GP"].max()).clip(upper=1).reindex(num.index)
+        seen = share.notna()
+        num[seen] += w * share[seen]
+        den[seen] += w
+    return (num / den).clip(0.05, 1.0)
 
 
 def _asof_minutes(season, day):
@@ -179,10 +214,10 @@ def _asof_minutes(season, day):
                          "GP": df["GP"], "MINUTES": df["MIN"].astype(float)})
 
 
-def _roster_raw(minutes, season, ratings, teams):
+def _roster_raw(minutes, season, ratings, teams, current=False):
     """Minutes-weighted player rating x 5 per team: roughly points per game better than average."""
     m = minutes[minutes["MINUTES"] > 0].copy()
-    m["R"] = _known_rating(m["PLAYER_ID"].to_numpy(), season, ratings).to_numpy()
+    m["R"] = _known_rating(m["PLAYER_ID"].to_numpy(), season, ratings, current).to_numpy()
     s = (m["R"] * m["MINUTES"]).groupby(m["TEAM"]).sum() / m.groupby("TEAM")["MINUTES"].sum() * 5
     return s.reindex(teams)
 
@@ -332,27 +367,28 @@ def fit_projection(df_master=None, rating_model=None, verbose=True, cutoff_now=N
 def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, team_gp):
     """Per remaining game, each side's change in strength from who is available, against the lineup so far.
 
-    Each player's share going forward is his minutes per team game so far, so
-    with nobody out the lineup matches the one so far. A rotation player
-    (ROTATION_MPG+) who has missed games is assumed hurt and back, at his
-    minutes per game x AVAILABILITY. Players in `absences` are out for that
-    many of their team's next games.
+    A rotation player's share going forward (ROTATION_MPG+ when he plays) is
+    his minutes per game x his expected availability (_availability: his last
+    three seasons' games played, pulled toward the usual rate), so a player who
+    often misses games counts for less and his minutes go to teammates. Bench
+    players keep the minutes per team game they have actually been getting
+    (their games missed are mostly the coach's choice). Players in `absences` are
+    out for that many of their team's next games.
     """
     from player_ranking import _regular_season
     cur = _regular_season(df_master)
     cur = cur[cur["SEASON"] == season].sort_values("GP").drop_duplicates("PLAYER_ID", keep="last")   # his main team
     pids = cur["PLAYER_ID"].astype(int).to_numpy()
-    rating = _known_rating(pids, season, proj.ratings).to_numpy()
+    rating = _known_rating(pids, season, proj.ratings, current=True).to_numpy()
     last = proj.ratings.get(SEASONS[SEASONS.index(season) - 1], pd.DataFrame(columns=["MPG"]))["MPG"]
     mpg = np.where(cur["GP"].to_numpy() >= SETTLED_GP, cur["MIN"].to_numpy(float),
                    pd.Series(pids).map(last).fillna(pd.Series(cur["MIN"].to_numpy(float))).to_numpy())
+    avail = _availability(pids, season, proj.ratings).to_numpy()
     tgp = cur["TEAM_ABBREVIATION"].map(team_gp).clip(lower=1).to_numpy(float)
-    gp = cur["GP"].to_numpy(float)
-    so_far = cur["MIN"].to_numpy(float) * gp / tgp                       # minutes per team game so far
-    back = (mpg >= ROTATION_MPG) & (gp < tgp)
-    share = np.where(back, np.maximum(so_far, mpg * AVAILABILITY), so_far)
+    so_far = cur["MIN"].to_numpy(float) * cur["GP"].to_numpy(float) / tgp           # minutes per team game so far
+    share = np.where(mpg >= ROTATION_MPG, mpg * avail, so_far)
     roster = pd.DataFrame({"TEAM": cur["TEAM_ABBREVIATION"].to_numpy(), "NAME": cur["PLAYER_NAME"].to_numpy(),
-                           "R": rating, "MPG": share, "OUT": cur["PLAYER_NAME"].map(absences or {}).fillna(0).to_numpy()})
+                           "R": rating, "MPG": share, "AVAIL": avail, "OUT": cur["PLAYER_NAME"].map(absences or {}).fillna(0).to_numpy()})
     long = pd.concat([pd.DataFrame({"G": np.arange(len(rest)), "T": rest["HOME"].to_numpy(), "SIDE": "H", "DATE": rest["DATE"].to_numpy()}),
                       pd.DataFrame({"G": np.arange(len(rest)), "T": rest["AWAY"].to_numpy(), "SIDE": "A", "DATE": rest["DATE"].to_numpy()})])
     long = long.sort_values(["DATE", "G"])
@@ -385,8 +421,8 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     With df_master (and a proj fitted with players), the prior uses the roster
     and `absences` ({player name: games still to miss}, e.g. KNOWN_ABSENCES)
     adjusts each remaining game. LINEUP_ADJ is the average adjustment over the
-    remaining games, in points: negative while someone is out, positive for a
-    team getting players back whose minutes so far were thin.
+    remaining games, in points: negative for a team with players out or prone
+    to missing games, positive for one getting players back.
     """
     played = load_games(season)
     teams = sorted(proj.final[SEASONS[-2]].index)
@@ -398,7 +434,7 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
         cur = cur[cur["SEASON"] == season]
         minutes = pd.DataFrame({"PLAYER_ID": cur["PLAYER_ID"].astype(int).to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
                                 "GP": cur["GP"].to_numpy(), "MINUTES": (cur["MIN"] * cur["GP"]).astype(float).to_numpy()})
-        now_raw = _roster_raw(minutes, season, proj.ratings, teams)
+        now_raw = _roster_raw(minutes, season, proj.ratings, teams, current=True)
         prior = prior + proj.roster_weight * _centered(now_raw).to_numpy()
     r, h, n = _ratings(played, teams, prior, proj.prior_games)
     wins_now, gp = _record(played, teams)
