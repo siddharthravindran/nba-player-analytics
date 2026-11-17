@@ -416,7 +416,7 @@ def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw,
     return (ha, aa, end), avg
 
 
-def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=None):
+def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=None, return_sims=False):
     """This season: wins so far, expected final wins, an 80% range, and the chance of the top 6 / top 10 in the conference.
 
     PLAYOFFS adds the play-in: seeds 7-10 play it out (7 hosts 8, 9 hosts 10, the
@@ -482,6 +482,8 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     })
     out = out.sort_values(["CONF", "PROJ_W"], ascending=[True, False]).reset_index(drop=True)
     out.attrs.update(season=season, home_court=round(h, 2), remaining=len(rest))
+    if return_sims:                     # every simulated season, for draft-pick odds: final wins and who made the playoffs
+        return out, {"teams": list(teams), "wins": sim, "playoffs": playoffs}
     return out
 
 
