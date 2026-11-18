@@ -201,11 +201,38 @@ def _mvp_votes(refresh=False):
 RISING_STARS_TEAMS = {"Team Candace"}       # 2025's tournament included a rookie/sophomore team; not All-Stars
 
 
+def _allstar_marked(refresh=False):
+    """Players marked All-Star ("AS") in each season's Basketball-Reference per-game table: name_key, yr.
+
+    Catches selections the game pages miss (players who sat out for protocols
+    or anything else); it includes replacements, which _allstar_selections
+    takes back out using the game notes.
+    """
+    cache = DATA_DIR / "allstar_awards.parquet"
+    if cache.exists() and not refresh:
+        return pd.read_parquet(cache)
+    from io import StringIO
+    rows = []
+    for year in range(int(min(SEASONS)[:4]) + 1, int(max(SEASONS)[:4]) + 1):
+        html = _get(f"https://www.basketball-reference.com/leagues/NBA_{year}_per_game.html")
+        at = html.find('id="per_game_stats"')
+        if at < 0:
+            continue
+        t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+        if "Awards" not in t.columns:
+            continue
+        names = t.loc[t["Awards"].astype(str).str.contains(r"\bAS\b", na=False), "Player"].unique()
+        rows += [{"name_key": norm_name(n), "yr": year - 1} for n in names]
+    out = pd.DataFrame(rows).drop_duplicates()
+    out.to_parquet(cache)
+    return out
+
+
 def _allstar_selections(refresh=False):
     """Every All-Star selection since 2015-16 (Basketball-Reference box scores): name_key, yr, weight.
 
-    The box scores list who played; the notes add players selected but hurt
-    ("did not play due to injury") and name their replacements, who are taken
+    The box scores list who played; the notes add players selected who didn't
+    play (injury, health and safety protocols, coach's decision) and name their replacements, who are taken
     out: a replacement is the commissioner's pick, not the vote's. From 2025
     the game is a tournament over several pages, and the Rising Stars team is
     left out (RISING_STARS_TEAMS).
@@ -232,7 +259,8 @@ def _allstar_selections(refresh=False):
                         if isinstance(p, str) and p not in ("Reserves", "Starters", "Team Totals"):
                             rows.append({"yr": year - 1, "player": p, "team": tid, "kind": "played"})
                 text = re.sub(r"<[^>]+>", "", html)
-                for who, team, rest in re.findall(r"([A-Z][\w.'\- ]{2,40}?) \(([^()]+)\): Did not play due to injury;?([^\n]{0,120})", text):
+                # any "did not play" note: hurt, health and safety protocols, coach's decision; all were selected
+                for who, team, rest in re.findall(r"([A-Z][\w.'\- ]{2,40}?) \(([^()]+)\): Did not play[^;\n]*;?([^\n]{0,120})", text):
                     rows.append({"yr": year - 1, "player": who.strip(), "team": team, "kind": "injured"})
                     for sub in re.findall(r"Replaced by ([A-Z][\w.'\- ]+?)(?:$| and|\s{2})", rest) + \
                                re.findall(r"([A-Z][\w.'\- ]+?) named as replacement", rest):
@@ -240,7 +268,8 @@ def _allstar_selections(refresh=False):
         raw = pd.DataFrame(rows).drop_duplicates()
         raw.to_parquet(cache)
     raw = raw[~raw["team"].isin(RISING_STARS_TEAMS)].assign(name_key=lambda r: r["player"].map(norm_name))
-    out = raw.loc[raw["kind"].isin(["played", "injured"]), ["name_key", "yr"]].drop_duplicates()
+    marked = _allstar_marked(refresh)                       # every All-Star by Basketball-Reference's awards column
+    out = pd.concat([raw.loc[raw["kind"].isin(["played", "injured"]), ["name_key", "yr"]], marked]).drop_duplicates()
     subs = raw.loc[raw["kind"] == "replacement", ["name_key", "yr"]].drop_duplicates()
     out = out.merge(subs, how="left", indicator=True).query("_merge == 'left_only'").drop(columns="_merge")
     return out.assign(weight=1)
