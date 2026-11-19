@@ -57,6 +57,7 @@ AGES = range(19, 42)
 # Title value: a win isn't worth the same to everyone. Wins concentrated in one player move a team's title odds far
 # more than the same wins spread over a bench, and salaries can't show it (the max contract caps what stars are paid).
 TITLE_VALUE = 2.0                    # what a title is worth to a team, in salary caps: a judgment, not fitted
+REAL_TERMS = True                    # value in today's cap dollars: future seasons divided by cap growth (see _years)
 CONTEXT_RATING = 2.0                 # the team he's valued on: a solid playoff team (points per game better than average)
 # Re-signing rights: when a contract ends, the team holding him can re-sign him first. If he's worth more than the most
 # he can be paid, that edge is worth something. Counted for RESIGN_YEARS more seasons at the max (MAX_SHARE of the cap,
@@ -307,6 +308,12 @@ def _years(model, df_master, cap_growth, contracts, price, curve, availability=N
     y["RESIGN"] = False
     if title is not None and RESIGN_YEARS:
         y = pd.concat([y, _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift)], ignore_index=True)
+    # Real terms: the cap grows, but a contract's dollars don't. Every season's worth and salary is divided by how much
+    # the cap has grown by then, so all of it reads in today's cap dollars (sign-based option decisions are unaffected).
+    if REAL_TERMS:
+        deflate = (1 + cap_growth) ** -y["AHEAD"].astype(float)
+        for col in ("WORTH_M", "SALARY_M", "TITLE_M", "SURPLUS_M"):
+            y[col] = y[col] * deflate
     return y, price
 
 

@@ -178,8 +178,8 @@ def pick_value(team, year, rnd=1, curve=None, odds=None, protect=None, carry=Non
     if protect:
         p = np.where(slots > protect, p, 0.0)
     ahead = year - DRAFT_NOW + 1                                  # seasons until his rookie year
-    caps = SALARY_CAP[CURRENT] * (1 + CAP_GROWTH) ** (ahead + np.arange(CONTROL_YEARS))
-    per_slot = vals * caps.mean() * (1 + discount) ** -ahead / 1e6
+    # real terms: a share of the cap in any season is worth the same share of today's cap (no cap growth in the dollars)
+    per_slot = vals * SALARY_CAP[CURRENT] * (1 + discount) ** -ahead * (1 + CAP_GROWTH) ** -ahead / 1e6
     value = float(p @ per_slot)
     if detail:
         exp_slot = float((p * slots).sum() / max(p.sum(), 1e-9))

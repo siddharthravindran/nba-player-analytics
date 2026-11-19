@@ -234,7 +234,8 @@ def contracts_vs_market(scored, model="box", cap_growth=CAP_GROWTH, contracts=No
         counted = []
         for _, y in mine.iterrows():
             ahead = int(y["SEASON"][:4]) - int(CURRENT[:4])
-            pay, worth = float(y["Salary"]), max(float(rate.at[i, ahead]), MIN_PCT_CAP) * cap0 * (1 + cap_growth) ** ahead
+            # real terms: divide pay by the cap growth to that season (contracts are fixed dollars), worth at today's cap
+            pay, worth = float(y["Salary"]) / (1 + cap_growth) ** ahead, max(float(rate.at[i, ahead]), MIN_PCT_CAP) * cap0
             opt = str(y.get("OPTION", "") or "").lower()
             if ahead == 0 or "player" not in opt and "team" not in opt or ("player" in opt and pay > worth) \
                     or ("team" in opt and pay < worth):
