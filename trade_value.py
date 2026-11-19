@@ -64,7 +64,10 @@ CONTEXT_RATING = 2.0                 # the team he's valued on: a solid playoff 
 # by experience as the CBA sets it), only when he's worth more than that, at RESIGN_SHARE of the surplus because he
 # could still leave.
 RESIGN_YEARS = 3
-RESIGN_SHARE = 0.5
+# Chance the team keeps him when the deal ends. A judgment: the salary data can't measure it for big contracts
+# (their next-season salaries look the same whether they re-signed or not), and only ~20% of small expiring deals
+# stayed with the same team. Every re-signing is priced at the market rate, capped at the max.
+RESIGN_CHANCE = 0.6
 
 
 def _games_tables(df):
@@ -262,7 +265,24 @@ def _title_gain(points, beta, field, base=CONTEXT_RATING):
     return f(base + np.asarray(points, float)) - f(base)
 
 
-def _years(model, df_master, cap_growth, contracts, price, curve, availability=None, title=None):
+_MARKET_CACHE = {}
+
+
+def market_shares(df_master):
+    """Each player's market rate (share of the cap) this season, from the market salary model: name_key -> share."""
+    key = id(df_master)
+    if key not in _MARKET_CACHE:
+        import contextlib, io
+        from salary_market import score_market
+        with contextlib.redirect_stdout(io.StringIO()):
+            sc = score_market(df_master, verbose=False)
+        cur = sc[sc["SEASON"] == max(sc["SEASON"])]
+        _MARKET_CACHE.clear()
+        _MARKET_CACHE[key] = {name_key(p): float(m) for p, m in zip(cur["PLAYER_NAME"], cur["MARKET_BOX"])}
+    return _MARKET_CACHE[key]
+
+
+def _years(model, df_master, cap_growth, contracts, price, curve, availability=None, title=None, market=None):
     level = current_level(model, df_master, availability=availability)
     curve = fit_aging_curve(model, df_master) if curve is None else curve
     price = price_of_a_win(model, df_master) if price is None else price
@@ -307,7 +327,7 @@ def _years(model, df_master, cap_growth, contracts, price, curve, availability=N
     y["COUNTED"] = y.groupby("PLAYER_ID")["COUNTED"].cummin().astype(bool)
     y["RESIGN"] = False
     if title is not None and RESIGN_YEARS:
-        y = pd.concat([y, _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift)], ignore_index=True)
+        y = pd.concat([y, _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift, market)], ignore_index=True)
     # Real terms: the cap grows, but a contract's dollars don't. Every season's worth and salary is divided by how much
     # the cap has grown by then, so all of it reads in today's cap dollars (sign-based option decisions are unaffected).
     if REAL_TERMS:
@@ -317,9 +337,11 @@ def _years(model, df_master, cap_growth, contracts, price, curve, availability=N
     return y, price
 
 
-def _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift):
-    """Seasons after the contract, worth counting only if he'd be worth more than the max: see RESIGN_YEARS."""
+def _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift, market=None):
+    """Seasons after the contract. The team re-signs him at his market rate (capped at the max) if he's worth more,
+    with probability RESIGN_CHANCE, so only the gain above that price counts. See RESIGN_YEARS."""
     last = y[y["COUNTED"]].sort_values("AHEAD").groupby("PLAYER_ID").tail(1)
+    mkt = last["Player"].map(lambda p: (market or {}).get(name_key(p))).astype(float).to_numpy()
     rows = []
     for k in range(1, RESIGN_YEARS + 1):
         r = last.copy()
@@ -336,10 +358,11 @@ def _resign_years(y, per_point, replacement, price, this, cap_growth, title, dri
         r["WORTH_M"] = r["WINS"] * price * cap / 1e6 + r["TITLE_M"]
         exp = (r["AGE_THEN"] - 19).clip(lower=0)                      # rough years in the league, for the max tier
         max_share = np.where(exp <= 6, 0.25, np.where(exp <= 9, 0.30, 0.35))
-        r["SALARY_M"] = max_share * cap / 1e6
-        r["SURPLUS_M"] = (r["WORTH_M"] - r["SALARY_M"]).clip(lower=0) * RESIGN_SHARE
+        price_share = np.where(np.isnan(mkt), max_share, np.minimum(mkt, max_share))   # market rate, never above the max
+        r["SALARY_M"] = price_share * cap / 1e6
+        r["SURPLUS_M"] = (r["WORTH_M"] - r["SALARY_M"]).clip(lower=0) * RESIGN_CHANCE
         r["WORTH_M"] = r["SALARY_M"] + r["SURPLUS_M"]                  # so WORTH - OWED is the re-signing edge
-        r["TITLE_M"] = r["TITLE_M"] * RESIGN_SHARE * (r["SURPLUS_M"] > 0)
+        r["TITLE_M"] = r["TITLE_M"] * RESIGN_CHANCE * (r["SURPLUS_M"] > 0)
         r["Salary"] = r["SALARY_M"] * 1e6
         r["OPTION"], r["COUNTED"], r["RESIGN"] = "", r["SURPLUS_M"] > 0, True
         rows.append(r)
@@ -359,7 +382,7 @@ def trade_value(model, df_master, cap_growth=0.07, discount=0.0, contracts=None,
     WORTH_NOW_M / SALARY_NOW_M   full-season rates for this season, for a quick read
 
     TITLE_M         the part of WORTH_M that is title value (see TITLE_VALUE)
-    RESIGN_M        the edge of holding his rights when the deal ends (see RESIGN_YEARS); in TRADE_VALUE_M
+    RESIGN_M        the edge of holding his rights when the deal ends: re-signed at market (max-capped) with chance RESIGN_CHANCE (see RESIGN_YEARS)
 
     cap_growth: yearly rise in the cap, which is what a win costs (the CBA
     allows up to 10%). discount: yearly discount on future surplus; 0 treats a
@@ -375,7 +398,8 @@ def trade_value(model, df_master, cap_growth=0.07, discount=0.0, contracts=None,
     if title_value:
         beta, field = title_odds if title_odds is not None else fit_title_odds()
         title = (beta, field, title_value)
-    y, price = _years(model, df_master, cap_growth, contracts, price, curve, title=title)
+    market = market_shares(df_master) if (title is not None and RESIGN_YEARS) else None
+    y, price = _years(model, df_master, cap_growth, contracts, price, curve, title=title, market=market)
     y["DISCOUNT"] = (1 + discount) ** -y["AHEAD"]
     kept = y[y["COUNTED"]]
     resign = kept[kept["RESIGN"]]
@@ -424,3 +448,50 @@ def contract_outlook(model, df_master, player, cap_growth=0.07, contracts=None, 
     out = out.rename(columns={"AGE_THEN": "AGE"}).reset_index(drop=True)
     out.attrs.update(player=mine["Player"].iloc[0], trade_value=float(out.loc[out["COUNTED"], "SURPLUS_M"].sum()))
     return out
+
+
+def contract_length(model, df_master, player, aavs=(25e6, 30e6, 35e6, 40e6), lengths=range(1, 6), title_odds=None,
+                    contracts=None, verbose=True):
+    """Team surplus for a new contract to `player`, by annual salary (AAV) and length in seasons, in today's cap dollars.
+
+    The new deal starts the season after the current contract ends. Surplus = what he's worth over the deal
+    (wins, title odds, and any re-signing edge after it) minus what he's paid. It doesn't model whether he'd sign,
+    or his choice of years; it answers "for this salary, which length gives the team the most value".
+    """
+    base = contracts if contracts is not None else fetch_contract_years()
+    rows = base[base["Player"].astype(str) == player]
+    if rows.empty:
+        raise ValueError(f"{player} not in the contract data")
+    tmpl = rows.sort_values("SEASON").iloc[-1].copy()
+    cur = max(_regular_season(df_master)["SEASON"].unique())
+    start = int(cur[:4]) + 1
+    odds = title_odds if title_odds is not None else fit_title_odds()
+    out = []
+    for aav in aavs:
+        for n in lengths:
+            new = []
+            for k in range(n):
+                row = tmpl.copy()
+                row["SEASON"] = f"{start + k}-{str(start + k + 1)[2:]}"
+                row["Salary"] = aav
+                row["OPTION"] = ""
+                new.append(row)
+            other = base[~((base["Player"].astype(str) == player) & (base["SEASON"] >= f"{start}-"))]
+            contracts_n = pd.concat([other, pd.DataFrame(new)], ignore_index=True)
+            contracts_n = contracts_n[contracts_n["Player"].astype(str) != player].pipe(lambda d: d) if False else contracts_n
+            y, _ = _years(model, df_master, 0.07, contracts_n, None, None, title=(odds[0], odds[1], 2.0),
+                          market=market_shares(df_master))
+            mine = y[(y["Player"] == tmpl["Player"]) & y["COUNTED"]]
+            tail = mine[mine["RESIGN"]]
+            contract = mine[~mine["RESIGN"] & (mine["SEASON"] >= f"{start}-")]
+            surplus = float((mine["WORTH_M"] - mine["SALARY_M"]).sum())
+            out.append({"AAV_M": aav / 1e6, "YEARS": n, "THROUGH": f"{start + n - 1}-{str(start + n)[2:]}",
+                        "SURPLUS_M": round(surplus, 1), "CONTRACT_SURPLUS_M": round(float((contract["WORTH_M"] - contract["SALARY_M"]).sum()), 1),
+                        "RESIGN_TAIL_M": round(float((tail["WORTH_M"] - tail["SALARY_M"]).sum()), 1)})
+    res = pd.DataFrame(out)
+    best = res.loc[res.groupby("AAV_M")["SURPLUS_M"].idxmax()].set_index("AAV_M")
+    if verbose:
+        print(res.pivot(index="YEARS", columns="AAV_M", values="SURPLUS_M").round(1).to_string())
+        print("best length by salary:", best["YEARS"].to_dict())
+    res.attrs["best"] = best
+    return res
