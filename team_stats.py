@@ -903,3 +903,66 @@ def plot_open_looks(profile, **kw):
         title="Left open, or got open? — wide-open threes vs accuracy",
         xlabel="Share of 3-point attempts that are wide open (defender 6+ ft)",
         ylabel="3-point %", **kw)
+
+
+# =============================================================================
+# REPORT CARD
+# =============================================================================
+# Each skill is graded against the other 29 teams: A = top six, B = 7-12, C = 13-18, D = 19-24, F = bottom six.
+# Lower-is-better stats (points allowed, opponent percentages, turnover rate) are flipped so the best team ranks 1st.
+
+_SET_PLAYS = ("Cut", "Handoff", "Isolation", "Off screen", "P&R handler", "P&R roll man", "Post up", "Spot up")
+_LOWER_BETTER = {"HALF_COURT_DEF", "ISO_DEF", "PNR_DEF", "SPOTUP_DEF", "TRANSITION_DEF", "RIM_DEF", "THREE_DEF",
+                 "THREE_RATE_DEF", "TM_TOV", "CONTEST_EFG_DEF"}
+
+
+def _skill_values(data):
+    """Raw value per team for every skill (see report_card for the grading)."""
+    T = data["teams"].set_index("TEAM")
+    Z, P, C = data["zones"], data["play_types"], data["contest"]
+
+    def ppp(side, types=None, exclude=()):
+        x = P[P.SIDE == side]
+        x = x[x.PLAY_TYPE.isin(types)] if types else x[~x.PLAY_TYPE.isin(exclude)]
+        return (x.PPP * x.POSS).groupby(x.TEAM).sum() / x.POSS.groupby(x.TEAM).sum()
+
+    rim = Z[Z.ZONE == "Rim"].set_index(["TEAM", "SIDE"]).FG_PCT
+    th = Z[Z.ZONE.isin(["Corner 3", "Above-break 3"])]
+    tight = C[C.SIDE == "defense"].assign(TIGHT=lambda x: x.CONTEST.isin(["Very tight (0-2 ft)", "Tight (2-4 ft)"]))
+    t = tight[tight.TIGHT]
+    vals = {
+        "HALF_COURT_OFF": ppp("offense", _SET_PLAYS), "HALF_COURT_DEF": ppp("defense", _SET_PLAYS),
+        "ISO_OFF": ppp("offense", ("Isolation",)), "ISO_DEF": ppp("defense", ("Isolation",)),
+        "PNR_OFF": ppp("offense", ("P&R handler", "P&R roll man")), "PNR_DEF": ppp("defense", ("P&R handler", "P&R roll man")),
+        "SPOTUP_OFF": ppp("offense", ("Spot up",)), "SPOTUP_DEF": ppp("defense", ("Spot up",)),
+        "TRANSITION_OFF": ppp("offense", ("Transition",)), "TRANSITION_DEF": ppp("defense", ("Transition",)),
+        "RIM_OFF": rim.xs("offense", level=1), "RIM_DEF": rim.xs("defense", level=1),
+        "THREE_OFF": th[th.SIDE == "offense"].groupby("TEAM")[["FGM", "FGA"]].sum().pipe(lambda x: x.FGM / x.FGA),
+        "THREE_DEF": th[th.SIDE == "defense"].groupby("TEAM")[["FGM", "FGA"]].sum().pipe(lambda x: x.FGM / x.FGA),
+        "THREE_RATE_DEF": th[th.SIDE == "defense"].groupby("TEAM").FGA.sum() / Z[Z.SIDE == "defense"].groupby("TEAM").FGA.sum(),
+        "CONTEST_RATE_DEF": t.groupby("TEAM").FGA.sum() / tight.groupby("TEAM").FGA.sum(),
+        "CONTEST_EFG_DEF": t.groupby("TEAM").apply(lambda x: (x.EFG_PCT * x.FGA).sum() / x.FGA.sum()),
+        "AST_RATIO": T.AST_RATIO, "TM_TOV": T.TM_TOV_PCT, "OREB": T.OREB_PCT, "DREB": T.DREB_PCT,
+    }
+    return pd.DataFrame(vals).dropna(), T
+
+
+def report_card(season="2026-27", data=None):
+    """Letter grades per team and skill, plus net rating for context. Best team on each skill ranks first."""
+    data = data or load_team_data(season)
+    raw, T = _skill_values(data)
+    grades = pd.DataFrame(index=raw.index)
+    for c in raw.columns:
+        ranked = raw[c].rank(ascending=c in _LOWER_BETTER, method="first")       # lower is better: smallest value ranks 1st
+        grades[c] = ranked.map(lambda r: "A" if r <= 6 else "B" if r <= 12 else "C" if r <= 18 else "D" if r <= 24 else "F")
+    grades["NET_RATING"] = T.loc[grades.index, "NET_RATING"].round(1)
+    grades = grades.sort_values("NET_RATING", ascending=False)
+    grades.attrs["season"] = season
+    return grades
+
+
+def report_card_raw(season="2026-27", data=None):
+    """The numbers behind report_card, for the same teams."""
+    data = data or load_team_data(season)
+    raw, _ = _skill_values(data)
+    return raw.round(3)

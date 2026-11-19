@@ -669,10 +669,10 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     return out.head(top) if top else out
 
 
-def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12, next_up=5):
+def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12, next_up=12):
     """All-Stars by conference: the `spots` players voters would rate highest, then the next few in line.
 
-    SPOT     "starter" for a conference's top five, "reserve" for the rest of the 12, "next" for the replacements
+    SPOT     "starter" for a conference's top five, "reserve" for the rest of the 12, "next" for the next 12 in line (24 per conference)
     SCORE    the voting model's score (higher is better); it keeps separating players after CHANCE has hit zero
     AVAILABLE  chance he has missed no more than ALLSTAR_MISSED_LIMIT games by the vote
     CHANCE   his chance of being picked, from the All-Star voting model
