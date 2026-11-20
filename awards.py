@@ -979,6 +979,7 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15, track
                    out["Player"].map(norm_name).map(tr).fillna(0.0).to_numpy())
     out = out.sort_values("WIN_CHANCE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
+    out.insert(out.columns.get_loc("WIN_CHANCE") + 1, "WIN_PCT", (out["WIN_CHANCE"] * 100).round(1))   # the same chance as a percent
     out.attrs.update(season=season, n=len(out))
     return out.head(top) if top else out
 
@@ -1243,3 +1244,182 @@ def add_absences(df_master, overrides, season="2026-27", today=None):
     if done:
         print(f"⚠️ expired or not found, delete from the cell: {done}")
     return out
+
+
+# ---------------------------------------------------------------- Rookie of the Year and Sixth Man of the Year
+# Same listwise approach as MVP: a softmax over each season's pool, weights fitted to vote shares, a temperature
+# fitted on held-out seasons so the chances read as percentages. Pools: Rookie of the Year = first-year players;
+# Sixth Man = bench players (not starters, by Basketball-Reference's games-started column).
+
+def _vote_shares(name, years):
+    """Basketball-Reference award vote shares for a season-end year range: name_key, SEASON, share."""
+    from io import StringIO
+    from nba_viz_utils import cached_fetch as _cf
+    def fetch():
+        frames = []
+        for year in years:
+            try:
+                html = _get(f"https://www.basketball-reference.com/awards/awards_{year}.html")
+            except Exception as e:                       # a season's page isn't up yet (in progress)
+                print(f"   no {name} page for {year} yet ({type(e).__name__})")
+                continue
+            at = html.find(f'id="{name}"')
+            if at < 0:
+                continue
+            t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+            t.columns = [c[-1] if isinstance(c, tuple) else c for c in t.columns]
+            frames.append(t[["Player", "Share"]].assign(SEASON=f"{year - 1}-{str(year)[2:]}"))
+        return pd.concat(frames, ignore_index=True).astype({"Player": str, "Share": str})
+    raw = _cf(f"{name}_voting", fetch)
+    raw["name_key"] = raw.Player.map(norm_name)
+    raw["share"] = pd.to_numeric(raw.Share, errors="coerce").fillna(0.0)
+    return raw[["name_key", "SEASON", "share"]]
+
+
+def _starts_table():
+    """Each player-season's starter flag (games started at least half his games), from Basketball-Reference."""
+    from io import StringIO
+    from nba_viz_utils import cached_fetch as _cf
+    def fetch():
+        frames = []
+        for year in range(2016, int(max(SEASONS)[:4]) + 2):
+            try:
+                html = _get(f"https://www.basketball-reference.com/leagues/NBA_{year}_per_game.html")
+            except Exception as e:
+                print(f"   no per-game page for {year} yet ({type(e).__name__})")
+                continue
+            at = html.find('id="per_game_stats"')
+            if at < 0:
+                continue
+            t = pd.read_html(StringIO(html[html.rfind("<table", 0, at):html.find("</table>", at) + 8]))[0]
+            t = t[t["Player"].astype(str) != "Player"]
+            frames.append(t[["Player", "Team", "G", "GS"]].assign(SEASON=f"{year - 1}-{str(year)[2:]}"))
+        return pd.concat(frames, ignore_index=True)
+    gs = _cf("bbref_starts", fetch)
+    gs["GS"] = pd.to_numeric(gs.GS, errors="coerce"); gs["G"] = pd.to_numeric(gs.G, errors="coerce")
+    tot = gs[gs.Team == "TOT"].set_index(["Player", "SEASON"])
+    one = gs[gs.Team != "TOT"].drop_duplicates(["Player", "SEASON"], keep="last").set_index(["Player", "SEASON"])
+    s = pd.concat([tot, one[~one.index.isin(tot.index)]])[["G", "GS"]]
+    return pd.Series((s.GS >= s.G / 2).to_numpy(), index=pd.MultiIndex.from_tuples([(norm_name(p), se) for p, se in s.index]))
+
+
+def _award_pool(df_master, rating_model, award):
+    """One row per candidate per season, with the vote share, the season's inputs and a 'pool' flag."""
+    from player_ranking import rank_players as _rank
+    import contextlib, io
+    df = _regular_season(df_master)
+    with contextlib.redirect_stdout(io.StringIO()):
+        rated = {s: _rank(rating_model, df_master, s, min_min=0, min_gp=0).assign(PID=lambda t: t.PLAYER_ID.astype(str)).groupby("PID").RATING.mean()
+                 for s in SEASONS}
+    d = df.sort_values("GP").drop_duplicates(["PLAYER_ID", "SEASON"], keep="last").copy()
+    d["PID"] = d["PLAYER_ID"].astype(str)
+    d["key"] = d["PLAYER_NAME"].map(norm_name)
+    d["RATING"] = [rated[s].get(p, np.nan) for s, p in zip(d["SEASON"], d["PID"])]
+    d["MINUTES_PG"] = pd.to_numeric(d["MIN"], errors="coerce")
+    d["GAMES"] = pd.to_numeric(d["GP"], errors="coerce")
+    d["TEAM_RANK"] = d.groupby(["SEASON", "TEAM_ABBREVIATION"])["MINUTES_PG"].rank(ascending=False, method="first")
+    # games needed, as a share of the season's games so far (league max GP): 82-game seasons give 30% / 24%
+    season_games = d["SEASON"].map(d.groupby("SEASON")["GAMES"].max())
+    if award == "roy":
+        first = d.groupby("PID")["SEASON"].min()
+        d = d[d["PID"].map(first) == d["SEASON"]]
+        d = d[d["SEASON"] >= "2016-17"]
+        d = d[(d["MINUTES_PG"] >= 12) & (d["GAMES"] >= 0.3 * season_games.loc[d.index])]
+        votes = _vote_shares("roy", range(2016, int(max(SEASONS)[:4]) + 2)).set_index(["name_key", "SEASON"]).share
+    else:
+        starts = _starts_table()
+        d["STARTER"] = [bool(starts.get((k, s), False)) for k, s in zip(d["key"], d["SEASON"])]
+        d = d[(~d["STARTER"]) & (d["MINUTES_PG"] >= 15) & (d["GAMES"] >= 0.244 * season_games.loc[d.index])]
+        d = d[d["SEASON"] >= "2016-17"]
+        votes = _vote_shares("smoy", range(2016, int(max(SEASONS)[:4]) + 2)).set_index(["name_key", "SEASON"]).share
+    d["SHARE"] = [votes.get((k, s), 0.0) for k, s in zip(d["key"], d["SEASON"])]
+    return d.reset_index(drop=True)
+
+
+_VOTE_STATS = {
+    "roy": ["PTS", "MINUTES_PG", "TS_PCT", "USG_PCT", "RATING", "AST", "REB", "W_PCT", "GAMES"],
+    "smoy": ["PTS", "MINUTES_PG", "TS_PCT", "USG_PCT", "RATING", "AST", "REB", "W_PCT", "GAMES"],
+}
+
+
+def _fit_group_model(award, df_master, rating_model, penalty=None, verbose=True, title=""):
+    d = _award_pool(df_master, rating_model, award)
+    stats = _VOTE_STATS[award]
+    X = d[stats].apply(pd.to_numeric, errors="coerce")
+    Z = ((X - X.groupby(d["SEASON"]).transform("mean")) / X.groupby(d["SEASON"]).transform("std")).clip(-5, 5).fillna(0).to_numpy()
+    seasons = sorted(s for s in d["SEASON"].unique() if s < max(SEASONS))
+    idx = {s: np.flatnonzero((d["SEASON"] == s).to_numpy()) for s in d["SEASON"].unique()}
+    sh = d["SHARE"].to_numpy()
+    tgt = {s: sh[idx[s]] / max(sh[idx[s]].sum(), 1e-9) for s in seasons}
+    def held(lam):
+        out = {}
+        for s in seasons:
+            tr = [x for x in seasons if x != s]
+            w = _fit_shares(Z, [idx[x] for x in tr], [tgt[x] for x in tr], lam)
+            out[s] = Z[idx[s]] @ w
+        return out
+    if penalty is None:
+        penalty = min((0.003, 0.01, 0.03, 0.1, 0.3), key=lambda l: -np.mean([tgt[s] @ np.log(_softmax(sc) + 1e-12) for s, sc in held(l).items()]))
+    scores = held(penalty)
+    from scipy.optimize import minimize_scalar
+    def winner_loglik(t):
+        return -sum(np.log(_softmax(t * scores[s])[np.argmax(sh[idx[s]])] + 1e-12) for s in seasons)
+    temperature = float(minimize_scalar(winner_loglik, bounds=(0.5, 4.0), method="bounded").x)
+    ranks = {s: int(np.flatnonzero(np.argsort(-scores[s]) == np.argmax(sh[idx[s]]))[0]) + 1 for s in seasons}
+    top_scorer = {s: int(np.flatnonzero(np.argsort(-d["PTS"].to_numpy(float)[idx[s]]) == np.argmax(sh[idx[s]]))[0]) + 1 for s in seasons}
+    w = _fit_shares(Z, [idx[s] for s in seasons], [tgt[s] for s in seasons], penalty)
+    weights = pd.Series(w, index=stats).sort_values(key=np.abs, ascending=False)
+    check = pd.DataFrame({"SEASON": seasons, "WINNER_RANK": [ranks[s] for s in seasons], "TOP_SCORER_RANK": [top_scorer[s] for s in seasons]})
+    if verbose:
+        n = len(seasons)
+        print(f"\n{title} voting model: {int((sh > 0).sum())} vote-getters over {n} seasons, penalty {penalty:g}, temperature {temperature:.2f}")
+        print(f"Each season predicted without seeing it: winner first {sum(r == 1 for r in ranks.values())} of {n}; "
+              f"top scorer first {sum(r == 1 for r in top_scorer.values())} of {n}")
+        print("What voters reward: " + ", ".join(f"{k} ({v:+.2f})" for k, v in weights.head(6).items()))
+    model = AllNBAModel(weights, 0.0, penalty, seasons, check, None, award, temperature)
+    model.pool = d
+    return model
+
+
+def _predict_group(voters, df_master, rating_model, season, top, title):
+    d = _award_pool(df_master, rating_model, voters.award)
+    cur = d[d["SEASON"] == season].copy()
+    if cur.empty:
+        raise ValueError(f"no candidates for {season}")
+    # standardize within each season's pool, the same way the fitted model did, then keep this season's rows
+    X = d[_VOTE_STATS[voters.award]].apply(pd.to_numeric, errors="coerce")
+    Z = ((X - X.groupby(d["SEASON"]).transform("mean")) / X.groupby(d["SEASON"]).transform("std")).clip(-5, 5).fillna(0).to_numpy()
+    rows = np.flatnonzero((d["SEASON"] == season).to_numpy())
+    score = Z[rows] @ voters.weights.reindex(_VOTE_STATS[voters.award]).to_numpy()
+    chance = _softmax(voters.temperature * score)
+    out = pd.DataFrame({"Player": cur["PLAYER_NAME"].to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
+                        "GP": cur["GAMES"].astype(int).to_numpy(), "MIN": cur["MINUTES_PG"].round(1).to_numpy(),
+                        "PTS": cur["PTS"].round(1).to_numpy(), "TS_PCT": cur["TS_PCT"].round(3).to_numpy(),
+                        "RATING": cur["RATING"].round(2).to_numpy(), "TEAM_W_PCT": cur["W_PCT"].round(3).to_numpy(),
+                        "WIN_PCT": (chance * 100).round(1)})
+    if cur["SHARE"].max() > 0:
+        out["ACTUAL_SHARE"] = cur["SHARE"].to_numpy()
+    out = out.sort_values("WIN_PCT", ascending=False).reset_index(drop=True)
+    out.insert(0, "RANK", np.arange(1, len(out) + 1))
+    out.attrs.update(season=season, title=title)
+    return out.head(top) if top else out
+
+
+def fit_roy_model(df_master, rating_model, penalty=None, verbose=True):
+    """Rookie of the Year voting model: the first-year players who got real minutes, trained on each season's vote shares."""
+    return _fit_group_model("roy", df_master, rating_model, penalty, verbose, "Rookie of the Year")
+
+
+def predict_roy(voters, df_master, rating_model, season="2026-27", top=10):
+    """Each rookie's percentage chance of winning Rookie of the Year, for a season (WIN_PCT adds up to 100 over the pool)."""
+    return _predict_group(voters, df_master, rating_model, season, top, "Rookie of the Year")
+
+
+def fit_smoy_model(df_master, rating_model, penalty=None, verbose=True):
+    """Sixth Man of the Year voting model: bench players (not starters), trained on each season's vote shares."""
+    return _fit_group_model("smoy", df_master, rating_model, penalty, verbose, "Sixth Man of the Year")
+
+
+def predict_smoy(voters, df_master, rating_model, season="2026-27", top=10):
+    """Each bench player's percentage chance of winning Sixth Man of the Year, for a season (WIN_PCT adds up to 100)."""
+    return _predict_group(voters, df_master, rating_model, season, top, "Sixth Man of the Year")
