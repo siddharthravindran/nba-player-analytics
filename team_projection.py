@@ -90,14 +90,38 @@ def load_games(season):
     out = pd.DataFrame({"DATE": pd.to_datetime(both["GAME_DATE_H"]), "HOME": both["TEAM_ABBREVIATION_H"],
                         "AWAY": both["TEAM_ABBREVIATION_A"], "HOME_PTS": both["PTS_H"], "AWAY_PTS": both["PTS_A"]})
     out["MARGIN"] = out["HOME_PTS"] - out["AWAY_PTS"]
-    return out.sort_values("DATE").reset_index().rename(columns={"index": "GAME_ID"})
+    out = out.sort_values("DATE").reset_index().rename(columns={"index": "GAME_ID"})
+    if season == CURRENT:
+        # the game log lists games still being played, with their scores so far: keep only finished ones
+        try:
+            sch = _schedule(season)
+            final = set(sch.loc[sch["gameStatus"] == 3, "gameId"].astype(str))
+            out = out[out["GAME_ID"].astype(str).isin(final)]
+        except Exception as e:
+            today = pd.Timestamp.today().normalize()
+            print(f"⚠️ schedule not available ({type(e).__name__}); leaving out games dated {today.date()} or later")
+            out = out[out["DATE"] < today]
+    return out.reset_index(drop=True)
+
+
+_SCHEDULE_MEMO = {}
+
+
+def _schedule(season):
+    """The league schedule with each game's status (3 = final); refetched at most every 10 minutes."""
+    hit = _SCHEDULE_MEMO.get(season)
+    if hit is not None and time.time() - hit[0] < 600:
+        return hit[1]
+    from nba_api.stats.endpoints import ScheduleLeagueV2
+    sch = cached_fetch(f"schedule_{season}", lambda: ScheduleLeagueV2(season=season, timeout=60).get_data_frames()[0],
+                       force_refresh=(season == CURRENT))
+    _SCHEDULE_MEMO[season] = (time.time(), sch)
+    return sch
 
 
 def _remaining_schedule(season=CURRENT):
     """Regular-season games not yet played (both teams known): HOME, AWAY, DATE."""
-    from nba_api.stats.endpoints import ScheduleLeagueV2
-    sch = cached_fetch(f"schedule_{season}", lambda: ScheduleLeagueV2(season=season, timeout=60).get_data_frames()[0],
-                       force_refresh=True)
+    sch = _schedule(season)
     sch = sch[sch["gameId"].astype(str).str.startswith("002") & (sch["gameStatus"] != 3)]
     sch = sch[sch["homeTeam_teamTricode"].notna() & sch["awayTeam_teamTricode"].notna()
               & (sch["homeTeam_teamTricode"] != "") & (sch["awayTeam_teamTricode"] != "")]
