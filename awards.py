@@ -80,7 +80,7 @@ GAMES_SLACK = 1
 # A season in progress: games played are projected to the end of the schedule for every award (_project_season).
 # For All-Defensive the stats are also weighed against this many games of last season. 25 is a judgment, not fitted.
 EARLY_PRIOR_GAMES = 25
-_PULL_TO_LAST_SEASON = {"defense"}
+_PULL_TO_LAST_SEASON = {"defense", "defense_norep"}
 # Games a player is known to be missing from today, for the season in progress: {"Stephen Curry": 12}.
 # Set it in the notebook (KNOWN_ABSENCES["Stephen Curry"] = 12) and every award counts those games as missed, in
 # the games projection and the 65-game rule. Weeks to games: about 3.5 games a week. Clear it when he is back.
@@ -278,6 +278,7 @@ def _allstar_selections(refresh=False):
 _AWARDS = {   # award -> (selections, stats, minimum minutes, team labels)
     "nba": (_allnba_selections, VOTER_STATS, POOL_MIN, TEAM_NAMES),
     "defense": (_alldefense_selections, DEFENSE_STATS, DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
+    "defense_norep": (_alldefense_selections, [s for s in DEFENSE_STATS if s != "PRIOR"], DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
     "mip": (_mip_selections, MIP_STATS, MIP_POOL_MIN, {1: "top 5"}),
     "mvp": (_mvp_votes, VOTER_STATS, POOL_MIN, {1: "MVP"}),
     "star": (_allstar_selections, VOTER_STATS, POOL_MIN, {1: "All-Star"}),
@@ -526,14 +527,16 @@ def fit_allnba_model(df_master, rating_model, penalty=None, verbose=True):
                       "the top 15 by wins added gets {BY_WINS}, by BPM {BY_BPM}, by points per game {BY_POINTS}")
 
 
-def fit_alldefense_model(df_master, rating_model, penalty=None, verbose=True):
+def fit_alldefense_model(df_master, rating_model, penalty=None, verbose=True, reputation=True):
     """Train the All-Defensive voting model, the same way as fit_allnba_model but on that vote and defensive stats.
 
     Ten spots a season instead of fifteen, so there is less to learn from and
     it is the less accurate of the two; .check has the season-by-season test.
     PRIOR here is All-Defensive selections in the previous three seasons.
+    reputation=False drops PRIOR: the vote as if judged on this season's defense alone.
     """
-    return _fit_votes(df_master, rating_model, "defense", penalty, verbose, "All-Defensive",
+    return _fit_votes(df_master, rating_model, "defense" if reputation else "defense_norep", penalty, verbose,
+                      "All-Defensive" if reputation else "All-Defensive (no reputation)",
                       {"BY_D_RATING": "D_RATING", "BY_DBPM": "BBR_DBPM", "BY_STOCKS": "STOCKS"},
                       "the top 10 by defensive impact rating gets {BY_D_RATING}, by defensive BPM {BY_DBPM}, "
                       "by steals plus blocks {BY_STOCKS}")
@@ -726,7 +729,7 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
 _defense_cache = {}
 
 
-def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=None):
+def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=None, reputation=True):
     """All-Defensive teams: each player's chance of a spot, best first, with the two projected teams.
 
     CHANCE     probability of making either team, from the All-Defensive voting model
@@ -740,13 +743,15 @@ def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=N
 
     voters: a model from fit_alldefense_model; fitted here (once per master)
     when not given. Same 65-game rule as All-NBA. Reputation counts for a lot
-    in this vote, so a first-time candidate is rated lower than his numbers.
+    in this vote, so a first-time candidate is rated lower than his numbers;
+    reputation=False uses a model fitted without past selections (PRIOR).
     """
     if voters is None:
-        key = (id(df_master), id(rating_model))
+        key = (id(df_master), id(rating_model), reputation)
         if key not in _defense_cache:
-            _defense_cache.clear()
-            _defense_cache[key] = fit_alldefense_model(df_master, rating_model, verbose=False)
+            for old in [k for k in _defense_cache if k[:2] != key[:2]]:   # a new master or rating model: drop the old fits
+                del _defense_cache[old]
+            _defense_cache[key] = fit_alldefense_model(df_master, rating_model, verbose=False, reputation=reputation)
         voters = _defense_cache[key]
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season)
     eligible = _can_reach(pool)
