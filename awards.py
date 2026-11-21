@@ -99,7 +99,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
