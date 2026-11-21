@@ -99,7 +99,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_mip_winner_model", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -772,7 +772,7 @@ def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=N
     return out.head(top) if top else out
 
 
-def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, strict=True):
+def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, strict=True, winner=None):
     """Most Improved Player candidates for a season, most likely first.
 
     strict=True leaves out the players voters almost never choose however big
@@ -781,7 +781,10 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     team (1 of 50). The model already marks both down; strict removes them.
     strict=False shows everyone, with the reason in WHY_NOT.
 
-    CHANCE     probability of finishing in the top five of the vote
+    WIN_PCT    chance of winning, in percent, adding up to 100 over the candidates
+               shown (only with winner= from fit_mip_winner_model; sorted by it then)
+    CHANCE     probability of finishing in the top five of the vote (TOP5_PCT: the same in percent;
+               these add up to about 500 over everyone, since five players finish top five)
     PTS_WAS / MIN_WAS / RATING_WAS   last season's numbers next to this season's
     PTS_BEST   his best scoring season before this one; a return to an old level rarely gets votes
     SOPHOMORE  True for second-year players, who rarely win
@@ -805,10 +808,70 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     out = out[out["CAN_REACH_65"]]
     if strict:
         out = out[~out["SOPHOMORE"] & ~out["ALL_NBA_BEFORE"]]
-    out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
+    out.insert(out.columns.get_loc("CHANCE") + 1, "TOP5_PCT", (out["CHANCE"] * 100).round(1))
+    order = "CHANCE"
+    if winner is not None:                    # chance of winning, over the candidates shown; adds up to 100
+        _, wz = _voter_table(df_master, rating_model, "mip")
+        score = wz.loc[out.index] @ winner.weights.reindex(wz.columns).fillna(0)
+        out.insert(out.columns.get_loc("CHANCE"), "WIN_PCT",
+                   (_weighted_softmax(winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100).round(1))
+        order = "WIN_PCT"
+    out = out.sort_values(order, ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out), strict=strict)
     return out.head(top) if top else out
+
+
+def fit_mip_winner_model(df_master, rating_model, penalty=None, verbose=True):
+    """Most Improved winner model, built like MVP: a softmax over each season's candidates fitted to vote shares.
+
+    Same inputs and pool as fit_mip_model (changes from last season, age, second
+    year, past All-NBA). Pass it to predict_mip(..., winner=) for WIN_PCT, each
+    candidate's chance of winning, adding up to 100.
+    """
+    from scipy.optimize import minimize_scalar
+    _mip_selections()                                                     # makes sure the vote cache exists
+    raw = pd.read_parquet(DATA_DIR / "mip_voting.parquet")
+    share = pd.Series(pd.to_numeric(raw["Share"], errors="coerce").fillna(0).to_numpy(),
+                      index=pd.MultiIndex.from_arrays([raw["Player"].map(norm_name), raw["SEASON"].str[:4].astype(int)]))
+    share = share.groupby(level=[0, 1]).max()
+    pool, Z = _voter_table(df_master, rating_model, "mip")
+    pool = pool.assign(SHARE=[share.get(k, 0.0) for k in zip(pool["name_key"], pool["yr"])])
+    X = Z.to_numpy()
+    seasons = sorted(s for s in pool.loc[pool["DECIDED"], "SEASON"].unique() if pool.loc[pool["SEASON"] == s, "SHARE"].sum() > 0)
+    rows = {s: np.flatnonzero((pool["SEASON"] == s).to_numpy()) for s in seasons}
+    sh = pool["SHARE"].to_numpy()
+    target = {s: sh[rows[s]] / sh[rows[s]].sum() for s in seasons}
+
+    def held_out(lam):
+        out = {}
+        for s in seasons:
+            train = [x for x in seasons if x != s]
+            out[s] = X[rows[s]] @ _fit_shares(X, [rows[x] for x in train], [target[x] for x in train], lam)
+        return out
+
+    if penalty is None:
+        penalty = min(MVP_PENALTIES, key=lambda l: -np.mean([target[s] @ np.log(_softmax(sc) + 1e-12) for s, sc in held_out(l).items()]))
+    scores = held_out(penalty)
+    win = {s: int(np.argmax(sh[rows[s]])) for s in seasons}
+    temperature = float(minimize_scalar(lambda t: -sum(np.log(_softmax(t * scores[s])[win[s]] + 1e-12) for s in seasons),
+                                        bounds=(0.5, 4.0), method="bounded").x)
+    rank = {s: int(np.flatnonzero(np.argsort(-scores[s]) == win[s])[0]) + 1 for s in seasons}
+    jump = pd.to_numeric(pool["UP_PTS"], errors="coerce").to_numpy() if "UP_PTS" in pool.columns else None
+    by_jump = {s: int(np.flatnonzero(np.argsort(-np.nan_to_num(jump[rows[s]], nan=-99)) == win[s])[0]) + 1 for s in seasons} if jump is not None else {}
+    check = pd.DataFrame({"SEASON": seasons, "WINNER_RANK": [rank[s] for s in seasons],
+                          "WINNER_CHANCE": [float(_softmax(temperature * scores[s])[win[s]]) for s in seasons],
+                          **({"BIGGEST_SCORING_JUMP_RANK": [by_jump[s] for s in seasons]} if by_jump else {})})
+    w = _fit_shares(X, list(rows.values()), list(target.values()), penalty)
+    weights = pd.Series(w, index=Z.columns).sort_values(key=np.abs, ascending=False)
+    if verbose:
+        n = len(seasons)
+        print(f"\nMost Improved winner model: {n} seasons of vote shares, penalty {penalty:g}, temperature {temperature:.2f}")
+        print(f"Each season predicted without seeing it: winner first {sum(r == 1 for r in rank.values())} of {n}, "
+              f"top three {sum(r <= 3 for r in rank.values())} of {n}"
+              + (f"; the biggest scoring jump was the winner {sum(r == 1 for r in by_jump.values())} of {n}" if by_jump else ""))
+        print("What voters reward: " + ", ".join(f"{LABELS.get(k, k)} ({v:+.2f})" for k, v in weights.head(6).items()))
+    return AllNBAModel(weights, 0.0, penalty, seasons, check, None, "mip", temperature)
 
 
 # ---------------------------------------------------------------- MVP
