@@ -1031,7 +1031,7 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15, track
     reasons = lambda row, sign: ", ".join(_mvp_label(k) for k, v in (row * sign).nlargest(2).items() if v > 0.15)
     out = pd.DataFrame({
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
-        "PTS": pool["PTS"], "REB": pool["REB"], "AST": pool["AST"], "W_PCT": pool["W_PCT"],
+        "PTS": pool["PTS"], "REB": pool["REB"], "AST": pool["AST"], "STL": pool["STL"], "BLK": pool["BLK"], "W_PCT": pool["W_PCT"],
         "TEAM_RANK": pool["TEAM_RANK"].astype(int),
         "WIN_CHANCE": _weighted_softmax(voters.temperature * score, reach), "SHARE_OF_POINTS": _softmax(score),
         "REACH_65": reach,
@@ -1039,8 +1039,8 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15, track
         "WHY": [reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [reasons(r, -1) for _, r in pull.iterrows()],
     }, index=pool.index)
     if pool["DECIDED"].any():
-        out.insert(10, "ACTUAL_SHARE", pool["SHARE"])
-        out.insert(11, "FINISH", pool["FINISH"])
+        out.insert(out.columns.get_loc("REACH_65"), "ACTUAL_SHARE", pool["SHARE"])
+        out.insert(out.columns.get_loc("REACH_65"), "FINISH", pool["FINISH"])
     tr = _tracker(season) if tracker else None
     if tr is not None:
         out.insert(out.columns.get_loc("SHARE_OF_POINTS") + 1, "TRACKER_PROB",
@@ -1172,7 +1172,8 @@ _allstar_cache = {}
 
 # ---------------------------------------------------------------- history
 AWARD_HISTORY = DATA_DIR / "award_history.parquet"
-AWARD_ORDER = ["MVP", "MVP (B-Ref tracker)", "All-NBA", "All-Star", "All-Defensive", "Most Improved"]
+AWARD_ORDER = ["MVP", "MVP (B-Ref tracker)", "All-NBA", "All-Star", "All-Defensive", "Most Improved",
+               "Rookie of the Year", "Sixth Man of the Year"]
 
 
 def _for_history(df_master, season):
@@ -1183,6 +1184,18 @@ def _for_history(df_master, season):
     drop = [c for c in df.columns if c.startswith("BBR_") and c != "BBR_AGE"]
     df.loc[now, drop] = np.nan
     return df
+
+
+def _group_snapshot(dm, rating_model, season, pen):
+    """Rookie of the Year and Sixth Man chances in the history's long format, and the penalties used."""
+    out, used = [], {}
+    for award, title in (("roy", "Rookie of the Year"), ("smoy", "Sixth Man of the Year")):
+        voters = _fit_group_model(award, dm, rating_model, pen.get(title), False, title)
+        t = _predict_group(voters, dm, rating_model, season, None, title)
+        out.append(pd.DataFrame({"AWARD": title, "Player": t["Player"], "TEAM": t["TEAM"], "GP": t["GP"],
+                                 "CHANCE": t["WIN_PCT"].astype(float) / 100, "RANK": t["RANK"]}))
+        used[title] = voters.penalty
+    return pd.concat(out, ignore_index=True), used
 
 
 def award_snapshot(df_master, rating_model, season="2026-27", penalties=None):
@@ -1210,6 +1223,7 @@ def award_snapshot(df_master, rating_model, season="2026-27", penalties=None):
             "All-Defensive": pick_all_defense(rating_model, dm, season, top=None, voters=dfn),
             "Most Improved": predict_mip(mip, dm, rating_model, season, top=None),
         }
+        groups, group_pens = _group_snapshot(dm, rating_model, season, pen)
     finally:
         KNOWN_ABSENCES.clear()
         KNOWN_ABSENCES.update(saved)
@@ -1224,8 +1238,9 @@ def award_snapshot(df_master, rating_model, season="2026-27", penalties=None):
         m = parts["MVP"][["Player", "TEAM", "GP"]].assign(CHANCE=lambda t: t["Player"].map(norm_name).map(tr).fillna(0.0))
         m = m.sort_values("CHANCE", ascending=False).reset_index(drop=True)
         out.append(m.assign(AWARD="MVP (B-Ref tracker)", RANK=np.arange(1, len(m) + 1))[["AWARD", "Player", "TEAM", "GP", "CHANCE", "RANK"]])
+    out.append(groups)
     out = pd.concat(out, ignore_index=True)
-    out.attrs["penalties"] = {"All-NBA": nba.penalty, "All-Star": star.penalty, "All-Defensive": dfn.penalty,
+    out.attrs["penalties"] = {**group_pens, "All-NBA": nba.penalty, "All-Star": star.penalty, "All-Defensive": dfn.penalty,
                               "Most Improved": mip.penalty, "MVP": mvp.penalty}
     return out
 
@@ -1345,12 +1360,17 @@ def _vote_shares(name, years):
 
 
 def _starts_table():
-    """Each player-season's starter flag (games started at least half his games), from Basketball-Reference."""
+    """Games and starts per player-season (G, GS) and a starter flag (started at least half his games), Basketball-Reference.
+
+    Past seasons are cached for good; the season in progress is refetched when its cache is a day old.
+    """
     from io import StringIO
-    from nba_viz_utils import cached_fetch as _cf
-    def fetch():
+    import time as _time
+    from nba_viz_utils import CACHE_DIR, cached_fetch as _cf
+    now_year = int(max(SEASONS)[:4]) + 1
+    def fetch(years):
         frames = []
-        for year in range(2016, int(max(SEASONS)[:4]) + 2):
+        for year in years:
             try:
                 html = _get(f"https://www.basketball-reference.com/leagues/NBA_{year}_per_game.html")
             except Exception as e:
@@ -1363,12 +1383,31 @@ def _starts_table():
             t = t[t["Player"].astype(str) != "Player"]
             frames.append(t[["Player", "Team", "G", "GS"]].assign(SEASON=f"{year - 1}-{str(year)[2:]}"))
         return pd.concat(frames, ignore_index=True)
-    gs = _cf("bbref_starts", fetch)
+    past = _cf("bbref_starts", lambda: fetch(range(2016, now_year)))
+    past = past[past["SEASON"] != max(SEASONS)]                        # an old cache may hold a stale copy of this season
+    path = CACHE_DIR / "bbref_starts_current.parquet"
+    stale = not path.exists() or _time.time() - path.stat().st_mtime > 86400
+    gs = pd.concat([past, _cf("bbref_starts_current", lambda: fetch([now_year]), force_refresh=stale)], ignore_index=True)
     gs["GS"] = pd.to_numeric(gs.GS, errors="coerce"); gs["G"] = pd.to_numeric(gs.G, errors="coerce")
     tot = gs[gs.Team == "TOT"].set_index(["Player", "SEASON"])
     one = gs[gs.Team != "TOT"].drop_duplicates(["Player", "SEASON"], keep="last").set_index(["Player", "SEASON"])
     s = pd.concat([tot, one[~one.index.isin(tot.index)]])[["G", "GS"]]
-    return pd.Series((s.GS >= s.G / 2).to_numpy(), index=pd.MultiIndex.from_tuples([(norm_name(p), se) for p, se in s.index]))
+    s.index = pd.MultiIndex.from_tuples([(norm_name(p), se) for p, se in s.index])
+    s = s[~s.index.duplicated(keep="first")]
+    return s.assign(STARTER=s.GS >= s.G / 2)
+
+
+def _bench_split(season):
+    """Per-game stats in games he came off the bench (NBA stats' starter/bench split), by PLAYER_ID; cached a day."""
+    import time as _time
+    from nba_api.stats.endpoints import LeagueDashPlayerStats
+    from nba_viz_utils import CACHE_DIR, cached_fetch as _cf
+    name = f"bench_split_{season}"
+    path = CACHE_DIR / f"{name}.parquet"
+    stale = season == max(SEASONS) and (not path.exists() or _time.time() - path.stat().st_mtime > 86400)
+    b = _cf(name, lambda: LeagueDashPlayerStats(season=season, starter_bench_nullable="Bench", per_mode_detailed="PerGame",
+                                                timeout=60).get_data_frames()[0], force_refresh=stale)
+    return b.set_index(b["PLAYER_ID"].astype(str))[["GP", "MIN", "PTS", "REB", "AST"]]
 
 
 def _award_pool(df_master, rating_model, award):
@@ -1396,7 +1435,9 @@ def _award_pool(df_master, rating_model, award):
         votes = _vote_shares("roy", range(2016, int(max(SEASONS)[:4]) + 2)).set_index(["name_key", "SEASON"]).share
     else:
         starts = _starts_table()
-        d["STARTER"] = [bool(starts.get((k, s), False)) for k, s in zip(d["key"], d["SEASON"])]
+        found = starts.reindex(pd.MultiIndex.from_arrays([d["key"], d["SEASON"]]))
+        d["STARTS"] = found["GS"].to_numpy()
+        d["STARTER"] = found["STARTER"].fillna(False).astype(bool).to_numpy()
         d = d[(~d["STARTER"]) & (d["MINUTES_PG"] >= 15) & (d["GAMES"] >= 0.244 * season_games.loc[d.index])]
         d = d[d["SEASON"] >= "2016-17"]
         votes = _vote_shares("smoy", range(2016, int(max(SEASONS)[:4]) + 2)).set_index(["name_key", "SEASON"]).share
@@ -1462,9 +1503,20 @@ def _predict_group(voters, df_master, rating_model, season, top, title):
     chance = _softmax(voters.temperature * score)
     out = pd.DataFrame({"Player": cur["PLAYER_NAME"].to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
                         "GP": cur["GAMES"].astype(int).to_numpy(), "MIN": cur["MINUTES_PG"].round(1).to_numpy(),
-                        "PTS": cur["PTS"].round(1).to_numpy(), "TS_PCT": cur["TS_PCT"].round(3).to_numpy(),
+                        "PTS": cur["PTS"].round(1).to_numpy(), "REB": cur["REB"].round(1).to_numpy(),
+                        "AST": cur["AST"].round(1).to_numpy(), "STL": cur["STL"].round(1).to_numpy(),
+                        "BLK": cur["BLK"].round(1).to_numpy(), "TS_PCT": cur["TS_PCT"].round(3).to_numpy(),
                         "RATING": cur["RATING"].round(2).to_numpy(), "TEAM_W_PCT": cur["W_PCT"].round(3).to_numpy(),
                         "WIN_PCT": (chance * 100).round(1)})
+    if voters.award == "smoy":                    # how much of his season came off the bench
+        out.insert(out.columns.get_loc("GP") + 1, "STARTS", cur["STARTS"].fillna(0).astype(int).to_numpy())
+        try:
+            bench = _bench_split(season).reindex(cur["PID"].to_numpy())
+            out["BENCH_GP"] = bench["GP"].fillna(0).astype(int).to_numpy()
+            out["BENCH_MIN"] = bench["MIN"].round(1).to_numpy()
+            out["BENCH_PTS"] = bench["PTS"].round(1).to_numpy()
+        except Exception as e:
+            print(f"⚠️ bench split not available ({type(e).__name__})")
     if cur["SHARE"].max() > 0:
         out["ACTUAL_SHARE"] = cur["SHARE"].to_numpy()
     out = out.sort_values("WIN_PCT", ascending=False).reset_index(drop=True)
