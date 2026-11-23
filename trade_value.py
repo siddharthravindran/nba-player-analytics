@@ -59,8 +59,8 @@ AGES = range(19, 42)
 # Title value: a win isn't worth the same to everyone. Wins concentrated in one player move a team's title odds far
 # more than the same wins spread over a bench, and salaries can't show it (the max contract caps what stars are paid).
 TITLE_VALUE = 2.0                    # what a title is worth to a team, in salary caps: a judgment, not fitted
-MINUTES_CHANGE = "rookies"           # project minutes ahead (fit_minutes): "rookies", "young" (also up to YOUNG: a cliff at that age), "all",
-                                     # or None (today's minutes forever). "all" also charges older players for decline and leaving the league
+MINUTES_CHANGE = "all"               # project minutes ahead (fit_minutes): "all", "rookies", "young" (rookies and up to YOUNG: a cliff at
+                                     # that age), or None (today's minutes forever)
 YOUNG = 24
 ROOKIE_GROWTH = True                 # rookies improve by draft slot, not only by age (fit_rookie_growth)
 REAL_TERMS = True                    # value in today's cap dollars: future seasons divided by cap growth (see _years)
@@ -280,10 +280,13 @@ def fit_minutes(model, df_master, horizons=(1, 2, 3), min_gp=10, min_mpg=12, ver
     """Minutes a game one to three seasons on: {(rookie, seasons ahead): weights on 1, mpg, age, level (, log slot)}.
 
     A straight line fitted on every rotation player-season since 2015-16, rookies apart (they also get the draft slot).
-    A player who is out of the league, or under min_gp games, counts as 0: many low-minute young players wash out
-    (41% of 12-18 minute rookies three years on), and leaving them out projected nearly all of them into bigger roles.
-    Held out one season at a time, the error against keeping today's minutes drops from 8.6 to 7.5, 10.5 to 9.1 and 11.6
-    to 10.2 (rookies, one to three seasons on) and 8.4 to 8.0, 10.1 to 9.2 and 11.9 to 10.2 (others up to 24).
+
+    Rookies: a player out of the league, or under min_gp games, counts as 0. Many low-minute rookies wash out (41% of
+    those at 12-18 minutes three years on). Held out a season at a time, the error against keeping today's minutes drops
+    from 8.6 to 7.5, 10.5 to 9.1 and 11.6 to 10.2, and the average is right for lottery picks, second-rounders and undrafted.
+    Others: only players still in the league. Counting dropouts as 0 is right for everyone in the league but not for
+    players under contract, who nearly always stay (94%+): for those it projects about 3 minutes too few by year three,
+    where this is within 1 (minutes x AVAILABILITY against real minutes; salary 3%+ of the cap, same deal).
     """
     df = _regular_season(df_master)
     first, slots, prior = _first_seasons(df), _draft_slots(), PRIOR_MINUTES / RECENCY[-1]
@@ -306,7 +309,8 @@ def fit_minutes(model, df_master, horizons=(1, 2, 3), min_gp=10, min_mpg=12, ver
     for h in horizons:
         t = d[(d["MIN"] >= min_mpg) & d["AGE"].notna()].copy()
         t = t[t["yr"] + h <= d["yr"].max()]
-        t["Y"] = later.reindex(pd.MultiIndex.from_arrays([t["PLAYER_ID"], t["yr"] + h])).fillna(0.0).to_numpy()
+        t["Y"] = later.reindex(pd.MultiIndex.from_arrays([t["PLAYER_ID"], t["yr"] + h])).to_numpy()
+        t = t[t["ROOKIE"] | t["Y"].notna()].fillna({"Y": 0.0})
         for rookie in (True, False):
             x = t[t["ROOKIE"] == rookie]
             F = np.column_stack([np.ones(len(x)), x["MIN"], x["AGE"], x["LEVEL"]] + ([x["SLOT"]] if rookie else []))
@@ -320,8 +324,8 @@ def fit_minutes(model, df_master, horizons=(1, 2, 3), min_gp=10, min_mpg=12, ver
 def _minutes_ahead(y, fit):
     """Each row's minutes a game AHEAD seasons on (three seasons' worth of change at most).
 
-    Players the setting leaves out keep today's, and so do stars (LEVEL 3+): the line would send them to 35+ minutes
-    when in the past they stayed where they were. Nobody already at 32 is projected higher, for the same reason.
+    Players the setting leaves out keep today's, and so do stars (LEVEL 3+): in the past they stayed where they were,
+    even past 32 (33 minutes three years on, against 28 by the line). Nobody already at 32 is projected higher.
     """
     out = y["MPG"].astype(float).copy()
     if not MINUTES_CHANGE:
