@@ -152,7 +152,7 @@ def _blend_last_season(mdf, model, features):
         a, b = full[now], pd.to_numeric(last[f], errors="coerce").to_numpy(float)
         full[now] = np.where(np.isnan(b), a, np.where(np.isnan(a), np.nan, w * a + (1 - w) * b))
         new[f] = full
-    return mdf.assign(**new)
+    return pd.concat([mdf.drop(columns=cols), pd.DataFrame(new, index=mdf.index)], axis=1)[list(mdf.columns)].copy()
 
 
 def score_market(df_master, version="v5", verbose=True, blend=True):
