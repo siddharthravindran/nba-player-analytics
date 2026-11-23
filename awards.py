@@ -637,6 +637,13 @@ def _reasons(row, sign):
     return ", ".join(LABELS[k] for k, v in picked.items() if v > 0.15)
 
 
+_BOX = ["PTS", "REB", "AST", "STL", "BLK", "FG3_PCT", "EFG_PCT"]          # shown next to the chances; not all are model inputs
+
+
+def _box(pool):
+    return {c: pd.to_numeric(pool[c], errors="coerce") if c in pool.columns else np.nan for c in _BOX}
+
+
 def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     """Each player's chance of an All-NBA spot for a season, best first, with the projected teams.
 
@@ -659,13 +666,13 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
 
     out = pd.DataFrame({
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
-        "TEAM_GAMES": pool["TEAM_GAMES"].astype(int), "PTS": pool["PTS"], "W_PCT": pool["W_PCT"],
+        "TEAM_GAMES": pool["TEAM_GAMES"].astype(int), **_box(pool), "W_PCT": pool["W_PCT"],
         "CHANCE": chance, "PROJECTED": _teams(chance, eligible),
         "CAN_REACH_65": eligible, "REACH_65": pool["REACH_65"], "RATING_RANK": pool["RATING"].rank(ascending=False).astype(int),
         "WHY": [reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [reasons(r, -1) for _, r in pull.iterrows()],
     })
     if pool["DECIDED"].any():
-        out.insert(8, "ACTUAL", pool["VOTES"].map(TEAM_NAMES).fillna(""))
+        out.insert(out.columns.get_loc("CAN_REACH_65"), "ACTUAL", pool["VOTES"].map(TEAM_NAMES).fillna(""))
     out = out.sort_values("CHANCE", ascending=False).reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out))
@@ -704,7 +711,7 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
     out = pd.DataFrame({
         "CONF": np.where(pool["TEAM_ABBREVIATION"].isin(EAST), "East", "West"),
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
-        "PTS": pool["PTS"], "W_PCT": pool["W_PCT"], "SCORE": score, "CHANCE": chance,
+        **_box(pool), "W_PCT": pool["W_PCT"], "SCORE": score, "CHANCE": chance,
         "RATING": pool["RATING"], "WHY": [_reasons(r, 1) for _, r in pull.iterrows()],
         "_STARTER": as_starter, "_RESERVE": as_reserve,
         "OK_STARTER": pool["ALLSTAR_OK_STARTER"], "OK_RESERVE": pool["ALLSTAR_OK_RESERVE"],
@@ -720,7 +727,7 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
         parts.append(g)
     out = pd.concat(parts)
     out["SPOT"] = np.select([out["RANK"] <= 5, out["RANK"] <= spots], ["starter", "reserve"], default="next")
-    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", "PTS", "W_PCT", "SCORE", "CHANCE", "AVAILABLE", "RATING_RANK", "WHY"]
+    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", *_BOX, "W_PCT", "SCORE", "CHANCE", "AVAILABLE", "RATING_RANK", "WHY"]
     out = out[cols].reset_index(drop=True)
     out.attrs.update(season=season)
     return out
