@@ -1443,6 +1443,22 @@ def _bench_split(season):
     return b.set_index(b["PLAYER_ID"].astype(str))[["GP", "MIN", "PTS", "REB", "AST"]]
 
 
+def _played_before(season):
+    """Ids of everyone who played a regular-season NBA game in the 13 seasons before `season`, the first in the data:
+    veterans who sat out that season, or were abroad, would otherwise look like rookies. Fetched once.
+    (NBA.com's FROM_YEAR won't do: it counts years on a roster, so Embiid and Simmons would not be rookies.)"""
+    def fetch():
+        from nba_api.stats.endpoints import LeagueDashPlayerStats
+        parts = []
+        for y in range(int(season[:4]) - 13, int(season[:4])):
+            part = cached_fetch(f"players_in_{y}", lambda: LeagueDashPlayerStats(
+                season=f"{y}-{(y + 1) % 100:02d}", timeout=45).get_data_frames()[0][["PLAYER_ID"]], retries=6, backoff=6)
+            parts.append(part)
+        return pd.concat(parts).drop_duplicates()
+    from nba_viz_utils import cached_fetch
+    return set(cached_fetch(f"players_before_{season}", fetch)["PLAYER_ID"].astype(str))
+
+
 def _award_pool(df_master, rating_model, award):
     """One row per candidate per season, with the vote share, the season's inputs and a 'pool' flag."""
     from player_ranking import rank_players as _rank
@@ -1462,7 +1478,7 @@ def _award_pool(df_master, rating_model, award):
     season_games = d["SEASON"].map(d.groupby("SEASON")["GAMES"].max())
     if award == "roy":
         first = d.groupby("PID")["SEASON"].min()
-        d = d[d["PID"].map(first) == d["SEASON"]]
+        d = d[(d["PID"].map(first) == d["SEASON"]) & ~d["PID"].isin(_played_before(first.min()))]
         d = d[d["SEASON"] >= "2016-17"]
         d = d[(d["MINUTES_PG"] >= 12) & (d["GAMES"] >= 0.3 * season_games.loc[d.index])]
         votes = _vote_shares("roy", range(2016, int(max(SEASONS)[:4]) + 2)).set_index(["name_key", "SEASON"]).share
