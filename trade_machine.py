@@ -48,7 +48,7 @@ import pandas as pd
 
 from nba_viz_utils import norm_name
 
-__all__ = ["Pick", "trade", "value_chart", "add_market_value", "SALARY_MATCH", "SALARY_CUSHION_M"]
+__all__ = ["Pick", "trade", "value_chart", "add_market_value", "overpaid", "SALARY_MATCH", "SALARY_CUSHION_M"]
 
 BLUE, ORANGE, GRID, MUTED, INK = "#2a78d6", "#eb6834", "#e4e3de", "#8a897f", "#0b0b0b"   # as in salaries.py
 SALARY_MATCH = 1.25
@@ -82,6 +82,36 @@ def add_market_value(tv, deals):
     keys = out["Player"].map(norm_name)
     out["MARKET_VALUE_M"] = keys.map(k["MARKET_M"] - k["OWED_M"])
     return out
+
+
+def overpaid(tv, deals, top=20, team=None, both=False):
+    """Overpaid contracts by each model, side by side, most overpaid (average of the two) first. $M over the rest of the deal.
+
+    OVER_WINS_M    owed minus what his projected wins and title odds are worth (trade_value)
+    OVER_MARKET_M  owed minus what the league pays players like him (salary_market)
+    RANK_WINS / RANK_MARKET   1 = most overpaid, among the players both models cover
+    BOTH           overpaid by both
+    both=True keeps only those. A negative number is a bargain. The wins view
+    counts only the games left this season and the market view all of it, and
+    each decides options its own way (YEARS is the wins view's), so compare
+    ranks and signs more than dollars.
+    """
+    d = add_market_value(tv, deals)
+    d["OVER_WINS_M"] = d["OWED_M"] - d["WORTH_M"]               # re-signing rights are left out: this is the contract alone
+    d["OVER_MARKET_M"] = -d["MARKET_VALUE_M"]
+    d = d.dropna(subset=["OVER_WINS_M", "OVER_MARKET_M"])
+    d["RANK_WINS"] = d["OVER_WINS_M"].rank(ascending=False).astype(int)
+    d["RANK_MARKET"] = d["OVER_MARKET_M"].rank(ascending=False).astype(int)
+    d["BOTH"] = (d["OVER_WINS_M"] > 0) & (d["OVER_MARKET_M"] > 0)
+    d["AVG_OVER_M"] = (d["OVER_WINS_M"] + d["OVER_MARKET_M"]) / 2
+    if team:
+        d = d[d["TEAM"] == team]
+    if both:
+        d = d[d["BOTH"]]
+    d = d.sort_values("AVG_OVER_M", ascending=False).reset_index(drop=True)
+    cols = ["Player", "TEAM", "AGE", "YEARS", "THROUGH", "OWED_M", "OVER_WINS_M", "OVER_MARKET_M", "AVG_OVER_M",
+            "RANK_WINS", "RANK_MARKET", "BOTH"]
+    return d[cols].head(top) if top else d[cols]
 
 
 def _value(row, basis):

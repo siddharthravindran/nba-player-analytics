@@ -43,6 +43,10 @@ VERSIONS = {
     # v3: retrained the same way, with undrafted players' EXPERIENCE counted from their first NBA season.
     "v3": {"box": ("data/salary_model_v3.txt", "data/feats_v2.json"),
            "lebron": ("data/salary_model_v3_lebron.txt", "data/feats_v2_lebron.json")},
+    # v4: v3 retrained without a leftover input, the row number ('index'): a price must not depend on where a row sits.
+    # Same test accuracy (2023-24 to 2025-26: box R2 0.850, LEBRON 0.850; four-seed averages within 0.002 of v3).
+    "v4": {"box": ("data/salary_model_v4.txt", "data/feats_v4.json"),
+           "lebron": ("data/salary_model_v4_lebron.txt", "data/feats_v4_lebron.json")},
 }
 MODELS = VERSIONS["v2"]
 SALARY_FILE = "data/bbref_salaries_2015-2027.csv"
@@ -130,14 +134,15 @@ def _blend_last_season(mdf, model, features):
     return mdf.assign(**new)
 
 
-def score_market(df_master, version="v3", verbose=True, blend=True):
+def score_market(df_master, version="v4", verbose=True, blend=True):
     """Every scoreable player-season with the market rate from both saved models: MARKET_BOX / MARKET_LEBRON (share of cap).
 
     Scoreable as in the notebook: a salary, 20+ games (this season: on pace)
     and 10+ minutes; this season also needs MIN_GP_NOW real games.
     blend=True mixes this season's stats with last season's (BLEND_GAMES).
-    version "v3" (default) counts undrafted players' experience from their first
-    NBA season and scores with the v3 models; "v2" reproduces the notebook/app.
+    version "v4" (default) is v3 without the leftover row-number input; v3 counts
+    undrafted players' experience from their first NBA season; "v2" reproduces
+    the notebook/app.
     """
     t0 = time.time()
     models = VERSIONS[version]
@@ -191,7 +196,7 @@ def score_market(df_master, version="v3", verbose=True, blend=True):
     mdf = mdf.reset_index(drop=True)
     if blend:
         mdf = _blend_last_season(mdf, model, sorted(set(feats["box"]) | set(feats["lebron"])))
-    mdf["index"] = mdf.index                       # the saved models carry a leftover 'index' input (it has no weight)
+    mdf["index"] = mdf.index                       # only for v2 and v3, which carry a leftover row-number input
     import os
     for k, (path, _) in models.items():
         if os.path.exists(path):
@@ -216,7 +221,7 @@ def this_season(scored, season=CURRENT, model="box"):
     return out.sort_values("OVER_M", ascending=False).reset_index(drop=True)
 
 
-def market_ahead(rows, years_ahead, model="box", version="v3"):
+def market_ahead(rows, years_ahead, model="box", version="v4"):
     """The market rate (share of the cap) for these player-seasons, `years_ahead` seasons on.
 
     Rescored with EXPERIENCE + years_ahead (and its max-contract tier), and
@@ -251,7 +256,7 @@ def contracts_vs_market(scored, model="box", cap_growth=CAP_GROWTH, contracts=No
     now = scored[scored["SEASON"] == CURRENT].copy()
     now["name_key"] = now["PLAYER_NAME"].map(norm_name)
     span = int(c["SEASON"].str[:4].astype(int).max()) - int(CURRENT[:4]) + 1
-    version = scored.attrs.get("version", "v3")
+    version = scored.attrs.get("version", "v4")
     rate = pd.DataFrame({k: market_ahead(now, k, model, version) for k in range(span)})
     cap0 = SALARY_CAP[CURRENT]
     rows = []
