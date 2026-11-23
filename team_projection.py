@@ -84,8 +84,11 @@ def _fetch_games(season):
 def load_games(season):
     """One row per game played: GAME_ID, DATE, HOME, AWAY (abbreviations), HOME_PTS, AWAY_PTS, MARGIN (home minus away)."""
     g = _fetch_games(season)
-    home = g[g["MATCHUP"].str.contains(" vs. ")].set_index("GAME_ID")
-    away = g[g["MATCHUP"].str.contains(" @ ")].set_index("GAME_ID")
+    # neutral-site games can list both teams under the same "AWAY @ HOME", so read the home team from the text
+    is_home = g["TEAM_ABBREVIATION"] == np.where(g["MATCHUP"].str.contains(" @ "), g["MATCHUP"].str.split(" @ ").str[-1],
+                                                 g["MATCHUP"].str.split(" vs. ", regex=False).str[0])
+    home = g[is_home].set_index("GAME_ID")
+    away = g[~is_home].set_index("GAME_ID")
     both = home.join(away, lsuffix="_H", rsuffix="_A", how="inner")
     out = pd.DataFrame({"DATE": pd.to_datetime(both["GAME_DATE_H"]), "HOME": both["TEAM_ABBREVIATION_H"],
                         "AWAY": both["TEAM_ABBREVIATION_A"], "HOME_PTS": both["PTS_H"], "AWAY_PTS": both["PTS_A"]})
