@@ -281,7 +281,8 @@ _AWARDS = {   # award -> (selections, stats, minimum minutes, team labels)
     "defense_norep": (_alldefense_selections, [s for s in DEFENSE_STATS if s != "PRIOR"], DEFENSE_POOL_MIN, DEFENSE_TEAM_NAMES),
     "mip": (_mip_selections, MIP_STATS, MIP_POOL_MIN, {1: "top 5"}),
     "mvp": (_mvp_votes, VOTER_STATS, POOL_MIN, {1: "MVP"}),
-    "star": (_allstar_selections, VOTER_STATS, POOL_MIN, {1: "All-Star"}),
+    # no impact rating: it overlaps wins added (0.95 correlation), so it took a negative weight and cancelled it out
+    "star": (_allstar_selections, [s for s in VOTER_STATS if s != "RATING"], POOL_MIN, {1: "All-Star"}),
 }
 MVP_PENALTIES = (0.003, 0.01, 0.03, 0.1, 0.3)
 
