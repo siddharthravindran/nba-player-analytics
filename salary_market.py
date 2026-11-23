@@ -123,6 +123,7 @@ def score_market(df_master, version="v3", verbose=True):
     pace = 82 / model.loc[now, "TEAM_ABBREVIATION"].map(team_games).clip(lower=1)
     model["GP_ACTUAL"] = model["GP_rs"]
     for f in set(totals) | {"GP_rs"}:
+        model[f] = pd.to_numeric(model[f], errors="coerce").astype(float)      # whole-number columns can't hold the paced values
         model.loc[now, f] = model.loc[now, f] * pace
 
     model = attach_salaries(model, pd.read_csv(SALARY_FILE))
@@ -155,7 +156,7 @@ def score_market(df_master, version="v3", verbose=True):
         model = pd.concat([model, lagged], axis=1)
     model = model.drop(columns="_yr").loc[:, lambda m: ~m.columns.duplicated()]
 
-    real_gp = model["GP_ACTUAL"].where(model["SEASON"] == CURRENT, model["GP_rs"])
+    real_gp = model["GP_rs"].mask((model["SEASON"] == CURRENT).astype(bool), pd.to_numeric(model["GP_ACTUAL"], errors="coerce"))
     mdf = model[model["Salary"].notna() & (model["GP_rs"] >= 20) & (model["MIN_rs"] >= 10) & (real_gp >= MIN_GP_NOW)
                 & model["pct_cap"].notna()].copy()
     import contextlib, io
