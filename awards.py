@@ -821,7 +821,8 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     if winner is not None:                    # chance of winning, over the candidates shown; adds up to 100
         _, wz = _voter_table(df_master, rating_model, "mip")
         score = wz.loc[out.index] @ winner.weights.reindex(wz.columns).fillna(0)
-        out["_WIN"] = _win_chances(winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100
+        early = 1.0 if pool["DECIDED"].any() else _early("mip", pool["TEAM_GAMES"].median())
+        out["_WIN"] = _win_chances(early * winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100
         out.insert(out.columns.get_loc("CHANCE"), "WIN_PCT", out["_WIN"].round(1))
         order = "_WIN"                        # unrounded: sorting on WIN_PCT leaves everyone at 0.0 in no order
     out = out.sort_values(order, ascending=False).drop(columns="_WIN", errors="ignore").reset_index(drop=True)
@@ -908,6 +909,18 @@ def _win_chances(s, reach, sims=20_000, seed=0):
     w = (np.random.default_rng(seed).random((sims, len(e))) < reach) * e
     total = w.sum(axis=1, keepdims=True)
     return np.divide(w, total, out=np.zeros_like(w), where=total > 0)[total[:, 0] > 0].mean(axis=0)
+
+
+# How much early numbers overstate a lead. Past seasons frozen at 16, 30, 45 and 60 games (stand-in models without BPM
+# or the impact rating, 10-11 seasons, each season held out): Sixth Man leaders at 16 games were claimed at 80% and won
+# 2 of 10, Most Improved 57% and 2 of 10, and flattening helped both. It did not help MVP or Rookie of the Year
+# reliably, so they are left alone. The exponents: temperature x (games / 82) ** k.
+EARLY_FLATTEN = {"smoy": 1.0, "mip": 0.4}
+
+
+def _early(award, games):
+    """Temperature multiplier for a season in progress, after `games` games (1.0 at the end of a season)."""
+    return (min(max(float(games), 1.0), SEASON_GAMES) / SEASON_GAMES) ** EARLY_FLATTEN.get(award, 0.0)
 
 
 def _fit_shares(X, groups, targets, lam):
@@ -1520,14 +1533,16 @@ def _predict_group(voters, df_master, rating_model, season, top, title):
     Z = ((X - X.groupby(d["SEASON"]).transform("mean")) / X.groupby(d["SEASON"]).transform("std")).clip(-5, 5).fillna(0).to_numpy()
     rows = np.flatnonzero((d["SEASON"] == season).to_numpy())
     score = Z[rows] @ voters.weights.reindex(_VOTE_STATS[voters.award]).to_numpy()
-    chance = _softmax(voters.temperature * score)
+    games = cur["GAMES"].max()                   # league max; the season in progress only (a finished one is left as it is)
+    early = _early(voters.award, games) if season == max(SEASONS) and cur["SHARE"].max() == 0 else 1.0
+    chance = _softmax(early * voters.temperature * score)
     out = pd.DataFrame({"Player": cur["PLAYER_NAME"].to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
                         "GP": cur["GAMES"].astype(int).to_numpy(), "MIN": cur["MINUTES_PG"].round(1).to_numpy(),
                         "PTS": cur["PTS"].round(1).to_numpy(), "REB": cur["REB"].round(1).to_numpy(),
                         "AST": cur["AST"].round(1).to_numpy(), "STL": cur["STL"].round(1).to_numpy(),
                         "BLK": cur["BLK"].round(1).to_numpy(), "TS_PCT": cur["TS_PCT"].round(3).to_numpy(),
                         "RATING": cur["RATING"].round(2).to_numpy(), "TEAM_W_PCT": cur["W_PCT"].round(3).to_numpy(),
-                        "WIN_PCT": (chance * 100).round(1)})
+                        "WIN_PCT": (chance * 100).round(1), "_WIN": chance})
     if voters.award == "smoy":                    # how much of his season came off the bench
         out.insert(out.columns.get_loc("GP") + 1, "STARTS", cur["STARTS"].fillna(0).astype(int).to_numpy())
         try:
@@ -1539,7 +1554,7 @@ def _predict_group(voters, df_master, rating_model, season, top, title):
             print(f"⚠️ bench split not available ({type(e).__name__})")
     if cur["SHARE"].max() > 0:
         out["ACTUAL_SHARE"] = cur["SHARE"].to_numpy()
-    out = out.sort_values("WIN_PCT", ascending=False).reset_index(drop=True)
+    out = out.sort_values("_WIN", ascending=False).drop(columns="_WIN").reset_index(drop=True)    # unrounded
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, title=title)
     return out.head(top) if top else out
