@@ -4,6 +4,8 @@
     bt = run_backtest(df_master)                 # ~10 minutes; one row per contract-season per setting
     backtest_summary(bt)                         # prints the accuracy tables
     bt = load_backtest()                         # the saved run
+    carried_forward(bt, df_master)               # against a tougher baseline: last season's wins, unchanged (~1 minute)
+    calibration_chart(bt, "docs/backtest_calibration.png")
 
     python3 backtest.py                          # runs it, saves data/backtest.parquet and prints the summary
 
@@ -30,7 +32,7 @@ from nba_viz_utils import SALARY_CAP, SEASONS
 from player_ranking import fit_rating_model, rank_players
 from salaries import load_salaries
 
-__all__ = ["run_backtest", "backtest_summary", "load_backtest", "STARTS"]
+__all__ = ["run_backtest", "backtest_summary", "load_backtest", "carried_forward", "calibration_chart", "STARTS"]
 
 STARTS = ("2019-20", "2020-21", "2021-22", "2022-23", "2023-24", "2024-25")
 SETTINGS = {"full": dict(MINUTES_CHANGE="all", ROOKIE_GROWTH=True), "no minutes": dict(MINUTES_CHANGE=None, ROOKIE_GROWTH=True),
@@ -125,6 +127,71 @@ def _contract_totals(bt):
     return d.groupby(["SETTING", "START", "PLAYER_ID"]).agg(
         Player=("Player", "first"), YEARS_IN=("YEARS_IN", "first"), AGE=("AGE", "first"), SALARY=("SALARY", "sum"),
         PRED_M=("PRED_M", "sum"), ACTUAL_M=("ACTUAL_M", "sum"), SEASONS=("AHEAD", "size")).reset_index()
+
+
+def carried_forward(bt, df_master, boot=1000):
+    """Prints our error against assuming every season repeats the last one (WINS from a rating model fitted as of then, per 82 games).
+
+    The ranges resample players, not contracts: the same player is in several starts.
+    """
+    f = bt[bt["SETTING"] == "full"].copy()
+    last = {}
+    with _quiet():
+        for start in f["START"].unique():
+            known = df_master[df_master.index.get_level_values("SEASON") <= start]
+            r = rank_players(fit_rating_model(known, test_season=start, verbose=False), known, start, min_min=0, min_gp=0)
+            r = r.drop_duplicates("PLAYER_ID")
+            last[start] = (r["WINS"].clip(lower=0) * 82 / min(r["GP"].max(), 82)).set_axis(r["PLAYER_ID"].astype(str)).to_dict()
+    games = T._regular_season(df_master).groupby("SEASON")["GP"].max().clip(upper=82)
+    f["CARRIED"] = [last[s].get(p, 0.0) * games[t] / 82 for s, p, t in zip(f["START"], f["PLAYER_ID"], f["SEASON"])]
+    rmse = lambda e: float(np.sqrt(np.mean(np.square(e))))
+    for h, g in f.groupby("AHEAD"):
+        print(f"  {h} ahead  wins rmse {rmse(g['PRED_W'] - g['ACTUAL_W']):.2f} vs {rmse(g['CARRIED'] - g['ACTUAL_W']):.2f} carried forward")
+    ours, old = _contract_totals(f), _contract_totals(f.assign(PRED_W=f["CARRIED"]))
+    a, p, n, sal = ours["ACTUAL_M"].to_numpy(), ours["PRED_M"].to_numpy(), old["PRED_M"].to_numpy(), -ours["SALARY"].to_numpy()
+    corr = lambda x, i: np.corrcoef(x[i], a[i])[0, 1]
+    rows = {k: np.flatnonzero(ours["PLAYER_ID"] == k) for k in ours["PLAYER_ID"].unique()}
+    rng, keys = np.random.default_rng(0), list(rows)
+    draws = []
+    for _ in range(boot):
+        i = np.concatenate([rows[keys[k]] for k in rng.integers(len(keys), size=len(keys))])
+        draws.append((corr(p, i), corr(n, i), corr(sal, i), corr(p, i) - corr(n, i)))
+    lo, hi = np.percentile(draws, [2.5, 97.5], axis=0)
+    i = np.arange(len(a))
+    for k, (name, v) in enumerate((("ours", corr(p, i)), ("carried forward", corr(n, i)), ("salary alone", corr(sal, i)),
+                                   ("ours minus carried", corr(p, i) - corr(n, i)))):
+        print(f"  surplus correlation, {name:18s} {v:.3f}  (95% range {lo[k]:.2f} to {hi[k]:.2f})")
+    print(f"  surplus rmse {rmse(p - a):.1f} vs {rmse(n - a):.1f} carried forward ({len(a):,} contracts, {len(keys)} players)")
+
+
+def calibration_chart(bt, path=None):
+    """Predicted and actual surplus by tenth of predicted surplus."""
+    import matplotlib.pyplot as plt
+    g = _contract_totals(bt[bt["SETTING"] == "full"])
+    tenth = pd.qcut(g["PRED_M"].rank(method="first"), 10, labels=False) + 1
+    d = g.groupby(tenth)[["PRED_M", "ACTUAL_M"]].mean()
+    fig, ax = plt.subplots(figsize=(9, 4.6), dpi=160)
+    x, w = np.arange(len(d)), 0.36
+    for off, col, color, label in ((-w / 2 - 0.02, "PRED_M", "#a3a19b", "Predicted"), (w / 2 + 0.02, "ACTUAL_M", "#2a78d6", "What happened")):
+        ax.bar(x + off, d[col], w, color=color, label=label)
+        for k in (0, len(d) - 1):
+            v = d[col].iloc[k]
+            ax.annotate(f"{'-' if v < 0 else ''}${abs(v):.0f}M", (k + off, v), xytext=(0, 3 if v > 0 else -3), textcoords="offset points",
+                        ha="center", va="bottom" if v > 0 else "top", fontsize=8, color="#333")
+    ax.axhline(0, color="#555", lw=0.8)
+    ax.set_xticks(x, ["Worst\ntenth", *map(str, range(2, 10)), "Best\ntenth"])
+    ax.set_ylabel("Average surplus ($M, today's cap)", color="#333")
+    ax.yaxis.grid(True, color="#e6e5e0", lw=0.8)
+    ax.set_axisbelow(True)
+    ax.spines[["top", "right", "left", "bottom"]].set_visible(False)
+    ax.tick_params(length=0, colors="#333")
+    ax.margins(y=0.1)
+    ax.legend(frameon=False, loc="upper left")
+    ax.set_title(f"Contracts ranked by predicted surplus, {min(g['START'])} to {max(g['START'])} ({len(g):,} contracts)", loc="left", fontsize=11, color="#222")
+    fig.tight_layout()
+    if path:
+        fig.savefig(path, facecolor="white")
+    return ax
 
 
 def backtest_summary(bt):

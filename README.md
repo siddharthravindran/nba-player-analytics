@@ -85,6 +85,70 @@ metric) and its offensive/defensive role classifications.
 This is the direct test of the role-value blind spot: if a player reads as overpaid in the production model
 and fairly paid in the impact model, the difference *is* the scheme/fit value his own box score can't see.
 
+## Backtest: did trade value pay off?
+
+The project has grown past the salary model above. `trade_value.py` forecasts what each contract is worth to a
+team: the player's projected wins, priced at what the league pays for a win, minus what he is owed (plus title
+odds and re-signing rights, which this test leaves out). A forecast like that can't be checked today, so `backtest.py`
+makes it in the past, where the answer is known.
+
+**Method.** Stand at the end of each of six seasons (2019-20 to 2024-25). Refit the rating model, aging curve, price
+of a win, minutes, rookie growth and availability on that season and earlier. Project every contract up to three seasons
+ahead, then compare with the wins each player actually produced, priced the same way. That gives 2,405 contract
+forecasts covering 675 players.
+
+![Predicted and actual surplus by tenth of predicted surplus](docs/backtest_calibration.png)
+
+| | Trade value | Last season repeated | Salary alone |
+|---|---|---|---|
+| Correlation with actual surplus | **0.67** (0.61 to 0.72) | 0.57 (0.50 to 0.63) | 0.19 (0.06 to 0.33) |
+| Surplus error (RMSE) | **$19.8M** | $24.0M | |
+| Wins error, 1 / 2 / 3 seasons ahead (RMSE) | **1.48 / 1.84 / 2.05** | 1.68 / 2.16 / 2.42 | 1.90 / 2.23 / 2.38 |
+
+- **"Last season repeated" is the fair baseline:** it assumes every player keeps producing what he just did. Trade value
+  beats it in all six years. The gap in correlation is 0.10 (95% range 0.07 to 0.14).
+- **The dollars are close on average.** The best tenth was predicted at $38M and produced $36M; the worst tenth, -$37M
+  and -$30M, so it is somewhat harsh on bad contracts. 87% of the best tenth paid off, against 12% of the worst.
+- Ranges are 95%, from resampling players, because the same player appears at several starting points. The wins column
+  for salary alone is a straight line fitted to the test itself, which flatters it.
+
+**Biggest misses** (surplus over the seasons tested, at most three)
+
+| Too low | Predicted | Actual | Too high | Predicted | Actual |
+|---|---|---|---|---|---|
+| Gilgeous-Alexander, 2021-22 | -$16M | $178M | Simmons, 2020-21 | $11M | -$126M |
+| Gilgeous-Alexander, 2022-23 | $53M | $191M | Morant, 2022-23 | $29M | -$95M |
+| Jokic, 2019-20 | $69M | $189M | Embiid, 2022-23 | $20M | -$102M |
+| Garland, 2019-20 | -$32M | $77M | Robert Williams III, 2021-22 | $78M | -$27M |
+
+- **Breakouts and superstars come in too low:** the model expects average growth.
+- **The big overestimates are mostly players who barely played.** Of the 100 largest one-year misses among players at 24+
+  minutes a game, 47 were too high, and 40 of those played under half their games. Adding more games-played history to
+  the forecast did not help on held-out seasons, so there is no easy fix in the data used here.
+- **Not every addition helped.** Projecting changes in minutes leaves the error unchanged ($19.8M with, $19.6M without).
+  Rookie growth brings rookies' average closer ($12.8M predicted against $15.6M; $9.7M without it) but overshoots the
+  five best-rated rookies each year ($54M against $48M).
+
+**Limits**
+
+- There are no historical contracts in the data, only salaries. A salary that continues at normal raises is treated as
+  the same deal, which uses later seasons and favors players who stayed useful.
+- Outcomes come from the same family of rating model, so a blind spot in the rating is invisible here.
+- Parameters are refitted as of each date, but the model was designed by someone who had seen these seasons.
+- The two earliest starts lack the history to price a win and borrow the next one's price.
+- It tests season-end forecasts, not early-season ones.
+
+Hindsight in the design can only be ruled out by forecasting ahead. `frozen.py` saves a dated copy of the award, win-total and
+trade-value forecasts each week of 2026-27 in `data/frozen/`, never edited, to be graded after the season.
+
+```python
+from backtest import *
+bt = run_backtest(df_master)          # ~10 minutes; df_master is the full player-season table (the copy in this repo is out of date)
+backtest_summary(bt)
+carried_forward(bt, df_master)
+calibration_chart(bt, "docs/backtest_calibration.png")
+```
+
 ## Roadmap
 
 - **Contract-state features.** Salary is set once at signing and then fixed for years, so a residual today
