@@ -820,10 +820,10 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     if winner is not None:                    # chance of winning, over the candidates shown; adds up to 100
         _, wz = _voter_table(df_master, rating_model, "mip")
         score = wz.loc[out.index] @ winner.weights.reindex(wz.columns).fillna(0)
-        out.insert(out.columns.get_loc("CHANCE"), "WIN_PCT",
-                   (_weighted_softmax(winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100).round(1))
-        order = "WIN_PCT"
-    out = out.sort_values(order, ascending=False).reset_index(drop=True)
+        out["_WIN"] = _weighted_softmax(winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100
+        out.insert(out.columns.get_loc("CHANCE"), "WIN_PCT", out["_WIN"].round(1))
+        order = "_WIN"                        # unrounded: sorting on WIN_PCT leaves everyone at 0.0 in no order
+    out = out.sort_values(order, ascending=False).drop(columns="_WIN", errors="ignore").reset_index(drop=True)
     out.insert(0, "RANK", np.arange(1, len(out) + 1))
     out.attrs.update(season=season, n=len(out), strict=strict)
     return out.head(top) if top else out
