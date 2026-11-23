@@ -821,7 +821,7 @@ def predict_mip(voters, df_master, rating_model, season="2026-27", top=10, stric
     if winner is not None:                    # chance of winning, over the candidates shown; adds up to 100
         _, wz = _voter_table(df_master, rating_model, "mip")
         score = wz.loc[out.index] @ winner.weights.reindex(wz.columns).fillna(0)
-        out["_WIN"] = _weighted_softmax(winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100
+        out["_WIN"] = _win_chances(winner.temperature * score.to_numpy(), out["REACH_65"].to_numpy(float)) * 100
         out.insert(out.columns.get_loc("CHANCE"), "WIN_PCT", out["_WIN"].round(1))
         order = "_WIN"                        # unrounded: sorting on WIN_PCT leaves everyone at 0.0 in no order
     out = out.sort_values(order, ascending=False).drop(columns="_WIN", errors="ignore").reset_index(drop=True)
@@ -892,10 +892,22 @@ def _softmax(s):
     return e / e.sum()
 
 
-def _weighted_softmax(s, weight):
-    """Softmax where each player's term is scaled by the chance he is eligible at all."""
-    e = np.exp(s - s.max()) * weight
-    return e / e.sum()
+def _win_chances(s, reach, sims=20_000, seed=0):
+    """Chance each player wins when he must first qualify (reach = his chance of getting to 65 games).
+
+    Draws who qualifies `sims` times (independently), takes the softmax among
+    those who did, and averages. So nobody's chance can exceed his reach, and
+    when a favorite misses out his chance goes to the others. (Scaling the
+    softmax by reach instead, as this did before, let a big lead cancel the risk.)
+    """
+    reach = np.nan_to_num(np.asarray(reach, float))
+    e = np.exp(s - s.max())
+    if np.isin(reach, (0.0, 1.0)).all():                 # a finished season, or before the rule: nothing to draw
+        w = e * reach
+        return w / w.sum()
+    w = (np.random.default_rng(seed).random((sims, len(e))) < reach) * e
+    total = w.sum(axis=1, keepdims=True)
+    return np.divide(w, total, out=np.zeros_like(w), where=total > 0)[total[:, 0] > 0].mean(axis=0)
 
 
 def _fit_shares(X, groups, targets, lam):
@@ -1011,7 +1023,7 @@ def _tracker(season):
 def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15, tracker=True):
     """Each eligible player's chance of winning MVP for a season, and his expected share of the vote.
 
-    WIN_CHANCE   chance he wins; adds up to 1, and counts his chance of reaching 65 games (REACH_65)
+    WIN_CHANCE   chance he wins; adds up to 1, and can't exceed his chance of reaching 65 games (REACH_65)
     SHARE_OF_POINTS  his expected share of all the voting points cast; adds up to 1 over the players
     ACTUAL_SHARE / FINISH   what happened, for seasons already voted on
     TEAM_RANK    his team's record among all teams
@@ -1041,7 +1053,7 @@ def predict_mvp(voters, df_master, rating_model, season="2026-27", top=15, track
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
         "PTS": pool["PTS"], "REB": pool["REB"], "AST": pool["AST"], "STL": pool["STL"], "BLK": pool["BLK"], "W_PCT": pool["W_PCT"],
         "TEAM_RANK": pool["TEAM_RANK"].astype(int),
-        "WIN_CHANCE": _weighted_softmax(voters.temperature * score, reach), "SHARE_OF_POINTS": _softmax(score),
+        "WIN_CHANCE": _win_chances(voters.temperature * score, reach), "SHARE_OF_POINTS": _softmax(score),
         "REACH_65": reach,
         "RATING_RANK": rank_all.reindex(pool.index),
         "WHY": [reasons(r, 1) for _, r in pull.iterrows()], "WHY_NOT": [reasons(r, -1) for _, r in pull.iterrows()],
