@@ -105,11 +105,37 @@ def _debut_years():
     return dict(zip(p["PERSON_ID"].astype(str), pd.to_numeric(p["FROM_YEAR"], errors="coerce")))
 
 
-def score_market(df_master, version="v3", verbose=True):
+# Early in a season each stat is mixed with last season's: this season counts GP / (GP + BLEND_GAMES). Tested on past
+# seasons frozen at 16, 30, 45 and 60 games, against the rate the full season ended up giving: the average miss at 16
+# games drops 12% (box) and 9% (LEBRON); 4-6 was best, and by game 60 it makes no difference. Only box and advanced
+# stats could be frozen, so the tracking stats are blended the same way untested.
+BLEND_GAMES = 5
+BLEND_PRIOR_GP = 15                  # a last season shorter than this is not used
+
+
+def _blend_last_season(mdf, model, features):
+    """This season's inputs mixed with the player's last season, in place of a small sample on its own."""
+    now = np.flatnonzero((mdf["SEASON"] == CURRENT).to_numpy())
+    last = model[(model["SEASON"] == SEASONS[-2]) & (pd.to_numeric(model["GP_rs"], errors="coerce") >= BLEND_PRIOR_GP)]
+    last = last.drop_duplicates("PLAYER_ID").set_index("PLAYER_ID").reindex(mdf["PLAYER_ID"].to_numpy()[now])
+    gp = pd.to_numeric(mdf["GP_ACTUAL"], errors="coerce").to_numpy(float)[now]
+    w = gp / (gp + BLEND_GAMES)
+    cols = [f for f in features if f.endswith("_rs") and f in mdf.columns and f in last.columns]
+    new = {}
+    for f in cols:
+        full = pd.to_numeric(mdf[f], errors="coerce").to_numpy(float).copy()
+        a, b = full[now], pd.to_numeric(last[f], errors="coerce").to_numpy(float)
+        full[now] = np.where(np.isnan(b), a, np.where(np.isnan(a), np.nan, w * a + (1 - w) * b))
+        new[f] = full
+    return mdf.assign(**new)
+
+
+def score_market(df_master, version="v3", verbose=True, blend=True):
     """Every scoreable player-season with the market rate from both saved models: MARKET_BOX / MARKET_LEBRON (share of cap).
 
     Scoreable as in the notebook: a salary, 20+ games (this season: on pace)
     and 10+ minutes; this season also needs MIN_GP_NOW real games.
+    blend=True mixes this season's stats with last season's (BLEND_GAMES).
     version "v3" (default) counts undrafted players' experience from their first
     NBA season and scores with the v3 models; "v2" reproduces the notebook/app.
     """
@@ -163,6 +189,8 @@ def score_market(df_master, version="v3", verbose=True):
     with contextlib.redirect_stdout(io.StringIO()):
         mdf = lag_and_encode_lebron(merge_lebron(mdf, load_lebron_seasons("data")))
     mdf = mdf.reset_index(drop=True)
+    if blend:
+        mdf = _blend_last_season(mdf, model, sorted(set(feats["box"]) | set(feats["lebron"])))
     mdf["index"] = mdf.index                       # the saved models carry a leftover 'index' input (it has no weight)
     import os
     for k, (path, _) in models.items():
