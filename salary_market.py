@@ -23,7 +23,9 @@ two things for a season in progress:
     year (he'd pick it up), a team option if he'd be paid less; anything else
     is guaranteed.
 """
+import gzip
 import json
+import os
 import time
 
 import lightgbm as lgb
@@ -47,6 +49,10 @@ VERSIONS = {
     # Same test accuracy (2023-24 to 2025-26: box R2 0.850, LEBRON 0.850; four-seed averages within 0.002 of v3).
     "v4": {"box": ("data/salary_model_v4.txt", "data/feats_v4.json"),
            "lebron": ("data/salary_model_v4_lebron.txt", "data/feats_v4_lebron.json")},
+    # v5: v4 trained 10 times with different random seeds and averaged. One run's rates move $0.8M on average (up to
+    # $4M) from the seed alone; two independent averages of 10 differ by $0.26M (up to $1.3M). Test miss $3.96M -> $3.93M.
+    "v5": {"box": ("data/salary_model_v5.json.gz", "data/feats_v4.json"),
+           "lebron": ("data/salary_model_v5_lebron.json.gz", "data/feats_v4_lebron.json")},
 }
 MODELS = VERSIONS["v2"]
 SALARY_FILE = "data/bbref_salaries_2015-2027.csv"
@@ -69,6 +75,21 @@ def _season_totals(model, feats):
             if ok.sum() >= 30 and (a[ok] / b[ok]).median() < 0.4:
                 out.append(f)
     return out
+
+
+_BOOSTERS = {}
+
+
+def _predict(path, X):
+    """A saved model's predictions; a .json.gz holds several training runs, whose predictions are averaged."""
+    key = (path, os.path.getmtime(path))
+    if key not in _BOOSTERS:
+        if path.endswith(".json.gz"):
+            with gzip.open(path, "rt") as f:
+                _BOOSTERS[key] = [lgb.Booster(model_str=m) for m in json.load(f)]
+        else:
+            _BOOSTERS[key] = [lgb.Booster(model_file=path)]
+    return np.mean([b.predict(X) for b in _BOOSTERS[key]], axis=0)
 
 
 def _all_nba(model):
@@ -134,13 +155,14 @@ def _blend_last_season(mdf, model, features):
     return mdf.assign(**new)
 
 
-def score_market(df_master, version="v4", verbose=True, blend=True):
+def score_market(df_master, version="v5", verbose=True, blend=True):
     """Every scoreable player-season with the market rate from both saved models: MARKET_BOX / MARKET_LEBRON (share of cap).
 
     Scoreable as in the notebook: a salary, 20+ games (this season: on pace)
     and 10+ minutes; this season also needs MIN_GP_NOW real games.
     blend=True mixes this season's stats with last season's (BLEND_GAMES).
-    version "v4" (default) is v3 without the leftover row-number input; v3 counts
+    version "v5" (default) is v4 averaged over 10 training runs; v4 is v3
+    without the leftover row-number input; v3 counts
     undrafted players' experience from their first NBA season; "v2" reproduces
     the notebook/app.
     """
@@ -197,11 +219,10 @@ def score_market(df_master, version="v4", verbose=True, blend=True):
     if blend:
         mdf = _blend_last_season(mdf, model, sorted(set(feats["box"]) | set(feats["lebron"])))
     mdf["index"] = mdf.index                       # only for v2 and v3, which carry a leftover row-number input
-    import os
     for k, (path, _) in models.items():
         if os.path.exists(path):
             X = mdf.reindex(columns=feats[k]).apply(pd.to_numeric, errors="coerce")
-            mdf[f"MARKET_{k.upper()}"] = lgb.Booster(model_file=path).predict(X)
+            mdf[f"MARKET_{k.upper()}"] = _predict(path, X)
     if verbose:
         print(f"Market model scored {len(mdf)} player-seasons ({int((mdf['SEASON'] == CURRENT).sum())} this season) "
               f"in {time.time() - t0:.0f}s; on an 82-game pace this season: {sorted(set(totals) | {'GP_rs'})}")
@@ -221,7 +242,7 @@ def this_season(scored, season=CURRENT, model="box"):
     return out.sort_values("OVER_M", ascending=False).reset_index(drop=True)
 
 
-def market_ahead(rows, years_ahead, model="box", version="v4"):
+def market_ahead(rows, years_ahead, model="box", version="v5"):
     """The market rate (share of the cap) for these player-seasons, `years_ahead` seasons on.
 
     Rescored with EXPERIENCE + years_ahead (and its max-contract tier), and
@@ -238,7 +259,7 @@ def market_ahead(rows, years_ahead, model="box", version="v4"):
             if f in X.columns:
                 X[f"{f}_lag2"] = X[f"{f}_lag1"] if years_ahead == 1 else X[f]
                 X[f"{f}_lag1"] = X[f]
-    return pd.Series(lgb.Booster(model_file=path).predict(X), index=rows.index)
+    return pd.Series(_predict(path, X), index=rows.index)
 
 
 def contracts_vs_market(scored, model="box", cap_growth=CAP_GROWTH, contracts=None):
@@ -256,7 +277,7 @@ def contracts_vs_market(scored, model="box", cap_growth=CAP_GROWTH, contracts=No
     now = scored[scored["SEASON"] == CURRENT].copy()
     now["name_key"] = now["PLAYER_NAME"].map(norm_name)
     span = int(c["SEASON"].str[:4].astype(int).max()) - int(CURRENT[:4]) + 1
-    version = scored.attrs.get("version", "v4")
+    version = scored.attrs.get("version", "v5")
     rate = pd.DataFrame({k: market_ahead(now, k, model, version) for k in range(span)})
     cap0 = SALARY_CAP[CURRENT]
     rows = []
