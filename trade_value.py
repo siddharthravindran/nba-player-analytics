@@ -59,6 +59,9 @@ AGES = range(19, 42)
 # Title value: a win isn't worth the same to everyone. Wins concentrated in one player move a team's title odds far
 # more than the same wins spread over a bench, and salaries can't show it (the max contract caps what stars are paid).
 TITLE_VALUE = 2.0                    # what a title is worth to a team, in salary caps: a judgment, not fitted
+MINUTES_CHANGE = "rookies"           # project minutes ahead (fit_minutes): "rookies", "young" (also up to YOUNG: a cliff at that age), "all",
+                                     # or None (today's minutes forever). "all" also charges older players for decline and leaving the league
+YOUNG = 24
 ROOKIE_GROWTH = True                 # rookies improve by draft slot, not only by age (fit_rookie_growth)
 REAL_TERMS = True                    # value in today's cap dollars: future seasons divided by cap growth (see _years)
 CONTEXT_RATING = 2.0                 # the team he's valued on: a solid playoff team (points per game better than average)
@@ -273,6 +276,70 @@ def fit_rookie_growth(model, df_master, horizons=(1, 2, 3), min_minutes=(100, 30
     return float(a), float(b)
 
 
+def fit_minutes(model, df_master, horizons=(1, 2, 3), min_gp=10, min_mpg=12, verbose=False):
+    """Minutes a game one to three seasons on: {(rookie, seasons ahead): weights on 1, mpg, age, level (, log slot)}.
+
+    A straight line fitted on every rotation player-season since 2015-16, rookies apart (they also get the draft slot).
+    A player who is out of the league, or under min_gp games, counts as 0: many low-minute young players wash out
+    (41% of 12-18 minute rookies three years on), and leaving them out projected nearly all of them into bigger roles.
+    Held out one season at a time, the error against keeping today's minutes drops from 8.6 to 7.5, 10.5 to 9.1 and 11.6
+    to 10.2 (rookies, one to three seasons on) and 8.4 to 8.0, 10.1 to 9.2 and 11.9 to 10.2 (others up to 24).
+    """
+    df = _regular_season(df_master)
+    first, slots, prior = _first_seasons(df), _draft_slots(), PRIOR_MINUTES / RECENCY[-1]
+    parts = []
+    for s in sorted(df["SEASON"].unique()):
+        one = df[df["SEASON"] == s].sort_values("GP").drop_duplicates("PLAYER_ID", keep="last")
+        if one["GP"].max() < 0.5 * SEASON_GAMES:
+            continue                                                   # the season in progress
+        r = rank_players(model, df_master, s, min_min=0, min_gp=0).drop_duplicates("PLAYER_ID").set_index("PLAYER_ID")["RATING"]
+        m = one["GP"] * one["MIN"]
+        parts.append(pd.DataFrame({"PLAYER_ID": one["PLAYER_ID"], "yr": int(s[:4]), "GP": one["GP"], "MIN": one["MIN"], "AGE": one["BBR_AGE"],
+                                   "LEVEL": one["PLAYER_ID"].map(r).fillna(-2.0) * m / (m + prior)}))
+    d = pd.concat(parts, ignore_index=True)
+    d = d[d["GP"] >= min_gp]
+    d["ROOKIE"] = d["PLAYER_ID"].map(first) == d["yr"]
+    d["SLOT"] = np.log(d["PLAYER_ID"].astype(str).map(slots).fillna(UNDRAFTED))
+    later = d.set_index(["PLAYER_ID", "yr"])["MIN"]
+    later = later[~later.index.duplicated()]
+    out = {}
+    for h in horizons:
+        t = d[(d["MIN"] >= min_mpg) & d["AGE"].notna()].copy()
+        t = t[t["yr"] + h <= d["yr"].max()]
+        t["Y"] = later.reindex(pd.MultiIndex.from_arrays([t["PLAYER_ID"], t["yr"] + h])).fillna(0.0).to_numpy()
+        for rookie in (True, False):
+            x = t[t["ROOKIE"] == rookie]
+            F = np.column_stack([np.ones(len(x)), x["MIN"], x["AGE"], x["LEVEL"]] + ([x["SLOT"]] if rookie else []))
+            out[(rookie, h)] = np.linalg.lstsq(F.astype(float), x["Y"].to_numpy(float), rcond=None)[0]
+    if verbose:
+        for (rookie, h), b in out.items():
+            print(("rookies" if rookie else "others "), f"{h} on:", np.round(b, 2))
+    return out
+
+
+def _minutes_ahead(y, fit):
+    """Each row's minutes a game AHEAD seasons on (three seasons' worth of change at most).
+
+    Players the setting leaves out keep today's, and so do stars (LEVEL 3+): the line would send them to 35+ minutes
+    when in the past they stayed where they were. Nobody already at 32 is projected higher, for the same reason.
+    """
+    out = y["MPG"].astype(float).copy()
+    if not MINUTES_CHANGE:
+        return out
+    rookie = y["ROOKIE_SLOT"].notna()
+    who = (y["AHEAD"] > 0) & y["AGE"].notna() & (y["MPG"] >= 12) & (y["LEVEL"] < 3)
+    if MINUTES_CHANGE == "rookies":
+        who &= rookie
+    elif MINUTES_CHANGE == "young":
+        who &= rookie | (y["AGE"] <= YOUNG)
+    for (is_rookie, h), b in fit.items():
+        q = who & (rookie == is_rookie) & (y["AHEAD"].clip(upper=3) == h)
+        if q.any():
+            F = [np.ones(q.sum()), y.loc[q, "MPG"], y.loc[q, "AGE"], y.loc[q, "LEVEL"]] + ([np.log(y.loc[q, "ROOKIE_SLOT"])] if is_rookie else [])
+            out[q] = np.clip(np.column_stack(F).astype(float) @ b, 0, np.maximum(y.loc[q, "MPG"], 32))
+    return out
+
+
 def price_of_a_win(model, df_master, last=3, veteran_after=4):
     """Share of the salary cap teams pay per win above replacement, over the last finished seasons.
 
@@ -373,14 +440,16 @@ def _years(model, df_master, cap_growth, contracts, price, curve, availability=N
     growth = fit_rookie_growth(model, df_master) if ROOKIE_GROWTH else (0.0, 0.0)
     y["GROWTH"] = (growth[0] + growth[1] * np.log(y["ROOKIE_SLOT"])).fillna(0.0)         # rookies only, from next season on
     y["RATING"] = y["LEVEL"] + gain + y["GROWTH"] * (y["AHEAD"] > 0)
-    y["WINS"] = per_point * (y["RATING"] + replacement).clip(lower=0) * y["MPG"] * SEASON_GAMES * y["AVAILABILITY"]
+    minutes = fit_minutes(model, df_master) if MINUTES_CHANGE else {}
+    y["MPG_THEN"] = _minutes_ahead(y, minutes)
+    y["WINS"] = per_point * (y["RATING"] + replacement).clip(lower=0) * y["MPG_THEN"] * SEASON_GAMES * y["AVAILABILITY"]
     cap = SALARY_CAP[this] * (1 + cap_growth) ** y["AHEAD"]
     left = np.where(y["AHEAD"] == 0, ((SEASON_GAMES - y["TEAM_GAMES"]) / SEASON_GAMES).clip(0, 1), 1.0)
     y["WORTH_M"] = y["WINS"] * price * cap * left / 1e6
     y["TITLE_M"] = 0.0
     if title is not None and title[2]:                 # (beta, field, title value in caps)
         beta, field, caps = title
-        points = (y["RATING"] + replacement).clip(lower=0) * y["MPG"] / 48           # points per game over a replacement player
+        points = (y["RATING"] + replacement).clip(lower=0) * y["MPG_THEN"] / 48           # points per game over a replacement player
         y["TITLE_M"] = _title_gain(points, beta, field) * y["AVAILABILITY"] * caps * cap * left / 1e6
         y["WORTH_M"] = y["WORTH_M"] + y["TITLE_M"]
     y["SALARY_M"] = y["Salary"] * left / 1e6
@@ -393,7 +462,7 @@ def _years(model, df_master, cap_growth, contracts, price, curve, availability=N
     y["COUNTED"] = y.groupby("PLAYER_ID")["COUNTED"].cummin().astype(bool)
     y["RESIGN"] = False
     if title is not None and RESIGN_YEARS:
-        y = pd.concat([y, _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift, market)], ignore_index=True)
+        y = pd.concat([y, _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift, market, minutes)], ignore_index=True)
     # Real terms: the cap grows, but a contract's dollars don't. Every season's worth and salary is divided by how much
     # the cap has grown by then, so all of it reads in today's cap dollars (sign-based option decisions are unaffected).
     if REAL_TERMS:
@@ -403,7 +472,7 @@ def _years(model, df_master, cap_growth, contracts, price, curve, availability=N
     return y, price
 
 
-def _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift, market=None):
+def _resign_years(y, per_point, replacement, price, this, cap_growth, title, drift, market=None, minutes=None):
     """Seasons after the contract. The team re-signs him at his market rate (capped at the max) if he's worth more,
     with probability RESIGN_CHANCE, so only the gain above that price counts. See RESIGN_YEARS."""
     last = y[y["COUNTED"]].sort_values("AHEAD").groupby("PLAYER_ID").tail(1)
@@ -416,10 +485,11 @@ def _resign_years(y, per_point, replacement, price, this, cap_growth, title, dri
         age0 = last["AGE"].fillna(27).clip(min(AGES), max(AGES)).astype(int)
         r["AGE_THEN"] = r["AGE"] + r["AHEAD"]
         r["RATING"] = last["LEVEL"] + last["GROWTH"] + np.array([drift.loc[a:a + n - 1].sum() for a, n in zip(age0, r["AHEAD"])])
-        r["WINS"] = per_point * (r["RATING"] + replacement).clip(lower=0) * r["MPG"] * SEASON_GAMES * r["AVAILABILITY"]
+        r["MPG_THEN"] = _minutes_ahead(r, minutes or {})
+        r["WINS"] = per_point * (r["RATING"] + replacement).clip(lower=0) * r["MPG_THEN"] * SEASON_GAMES * r["AVAILABILITY"]
         cap = SALARY_CAP[this] * (1 + cap_growth) ** r["AHEAD"]
         beta, field, caps = title
-        points = (r["RATING"] + replacement).clip(lower=0) * r["MPG"] / 48
+        points = (r["RATING"] + replacement).clip(lower=0) * r["MPG_THEN"] / 48
         r["TITLE_M"] = _title_gain(points, beta, field) * r["AVAILABILITY"] * caps * cap / 1e6
         r["WORTH_M"] = r["WINS"] * price * cap / 1e6 + r["TITLE_M"]
         exp = (r["AGE_THEN"] - 19).clip(lower=0)                      # rough years in the league, for the max tier
