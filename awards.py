@@ -99,7 +99,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_mip_winner_model", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_mip_winner_model", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "deserving_allstars", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -735,6 +735,58 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
 
 
 _defense_cache = {}
+
+
+def deserving_allstars(df_master, rating_model, bpm_model=None, season="2026-27", spots=12, next_up=8, voters=None):
+    """Who has earned an All-Star spot: the 12 in each conference who have added the most wins so far.
+
+    Nothing here is learned from voters: no reputation, usage, team record or scoring for its own sake. A player's wins
+    are his rating over a replacement player x the minutes he has played, so missed games cost him (no absences to come).
+
+    VALUE        wins added so far, the average of two ratings: ours built on LEBRON and the same one built on BPM
+    LEBRON_RANK, BPM_RANK, WS_RANK   conference rank by each of those two and by Basketball-Reference's win shares
+    AGREE        how many of the three have him in the conference's top 12: 3 is solid, 1 is arguable
+    FROM_12      VALUE minus the last spot's: near 0 is a coin flip
+    VOTE         where predict_allstars (who will be picked) has him: "starter", "reserve", or blank
+
+    "Deserves" is a choice, not something past seasons can test: this one is total value so far. bpm_model:
+    fit_rating_model(df_master, target="bpm"), fitted here if not given. The ratings share many inputs, so agreement
+    between them is weaker evidence than it looks. Early in a season all of it is noisy.
+    """
+    from player_ranking import fit_rating_model
+    if bpm_model is None:
+        bpm_model = fit_rating_model(df_master, target="bpm", verbose=False)
+    wins = {}
+    for name, m in (("LEBRON", rating_model), ("BPM", bpm_model)):
+        wins[name] = rank_players(m, df_master, season, min_min=0, min_gp=0).drop_duplicates("PLAYER_ID").set_index("PLAYER_ID")
+    d = _regular_season(df_master)
+    d = d[d["SEASON"] == season].sort_values("GP").drop_duplicates("PLAYER_ID", keep="last").set_index("PLAYER_ID")
+    d = d[d["MIN"] >= POOL_MIN].copy()
+    for name, w in wins.items():
+        d[f"{name}_W"] = w["WINS"].reindex(d.index)
+    d = d.dropna(subset=["LEBRON_W", "BPM_W"])
+    d["VALUE"] = (d["LEBRON_W"] + d["BPM_W"]) / 2
+    d["CONF"] = np.where(d["TEAM_ABBREVIATION"].isin(EAST), "East", "West")
+    by = {"LEBRON_RANK": "LEBRON_W", "BPM_RANK": "BPM_W", "WS_RANK": "BBR_WS"}
+    for rank, col in by.items():
+        d[rank] = d.groupby("CONF")[col].rank(ascending=False, method="min")
+    d["AGREE"] = (d[list(by)] <= spots).sum(axis=1)
+    d["RANK"] = d.groupby("CONF")["VALUE"].rank(ascending=False, method="first").astype(int)
+    last = d[d["RANK"] == spots].set_index("CONF")["VALUE"]
+    d["FROM_12"] = d["VALUE"] - d["CONF"].map(last)
+    if voters is not None:
+        picks = predict_allstars(voters, df_master, rating_model, season, spots=spots, next_up=0)
+        d["VOTE"] = d["PLAYER_NAME"].map(picks.set_index("Player")["SPOT"]).fillna("")
+    out = pd.DataFrame({"CONF": d["CONF"], "RANK": d["RANK"], "Player": d["PLAYER_NAME"], "TEAM": d["TEAM_ABBREVIATION"],
+                        "GP": d["GP"].astype(int), "MIN": d["MIN"], **_box(d), "TS_PCT": d["TS_PCT"], "VALUE": d["VALUE"].round(2),
+                        "FROM_12": d["FROM_12"].round(2), **{c: d[c] for c in by}, "AGREE": d["AGREE"]})
+    if voters is not None:
+        out["VOTE"] = d["VOTE"]
+    out = out[out["RANK"] <= spots + next_up].sort_values(["CONF", "RANK"]).reset_index(drop=True)
+    for c in by:
+        out[c] = out[c].astype("Int64")
+    out.attrs.update(season=season)
+    return out
 
 
 def pick_all_defense(rating_model, df_master, season="2026-27", top=20, voters=None, reputation=True):
