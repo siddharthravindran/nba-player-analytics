@@ -103,7 +103,7 @@ TEAM_NAMES = {3: "1st", 2: "2nd", 1: "3rd"}
 DEFENSE_TEAM_NAMES = {2: "1st", 1: "2nd"}
 EAST = {"ATL", "BOS", "BKN", "CHA", "CHI", "CLE", "DET", "IND", "MIA", "MIL", "NYK", "ORL", "PHI", "TOR", "WAS"}
 
-__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_mip_winner_model", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "deserving_allstars", "fit_alldefense_model", "pick_all_defense",
+__all__ = ["KNOWN_ABSENCES", "use_injury_report", "add_absences", "fit_allstar_model", "save_award_snapshot", "award_movers", "AllNBAModel", "fit_roy_model", "predict_roy", "fit_mip_winner_model", "fit_smoy_model", "predict_smoy", "fit_allnba_model", "predict_allnba", "predict_allstars", "deserving_allstars", "deserving_allnba", "picked_vs_deserving", "fit_alldefense_model", "pick_all_defense",
            "fit_mip_model", "predict_mip", "fit_mvp_model", "predict_mvp"]
 
 
@@ -768,6 +768,24 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
 _defense_cache = {}
 
 
+def _wins_added(df_master, rating_model, bpm_model, season):
+    """Rotation players' wins so far by the two ratings: LEBRON_W, BPM_W and VALUE, their average."""
+    from player_ranking import fit_rating_model
+    if bpm_model is None:
+        bpm_model = fit_rating_model(df_master, target="bpm", verbose=False)
+    wins = {}
+    for name, m in (("LEBRON", rating_model), ("BPM", bpm_model)):
+        wins[name] = rank_players(m, df_master, season, min_min=0, min_gp=0).drop_duplicates("PLAYER_ID").set_index("PLAYER_ID")
+    d = _regular_season(df_master)
+    d = d[d["SEASON"] == season].sort_values("GP").drop_duplicates("PLAYER_ID", keep="last").set_index("PLAYER_ID")
+    d = d[d["MIN"] >= POOL_MIN].copy()
+    for name, w in wins.items():
+        d[f"{name}_W"] = w["WINS"].reindex(d.index)
+    d = d.dropna(subset=["LEBRON_W", "BPM_W"])
+    d["VALUE"] = (d["LEBRON_W"] + d["BPM_W"]) / 2
+    return d
+
+
 def deserving_allstars(df_master, rating_model, bpm_model=None, season="2026-27", spots=12, next_up=8, voters=None):
     """Who has earned an All-Star spot: the 12 in each conference who have added the most wins so far.
 
@@ -784,19 +802,7 @@ def deserving_allstars(df_master, rating_model, bpm_model=None, season="2026-27"
     fit_rating_model(df_master, target="bpm"), fitted here if not given. The ratings share many inputs, so agreement
     between them is weaker evidence than it looks. Early in a season all of it is noisy.
     """
-    from player_ranking import fit_rating_model
-    if bpm_model is None:
-        bpm_model = fit_rating_model(df_master, target="bpm", verbose=False)
-    wins = {}
-    for name, m in (("LEBRON", rating_model), ("BPM", bpm_model)):
-        wins[name] = rank_players(m, df_master, season, min_min=0, min_gp=0).drop_duplicates("PLAYER_ID").set_index("PLAYER_ID")
-    d = _regular_season(df_master)
-    d = d[d["SEASON"] == season].sort_values("GP").drop_duplicates("PLAYER_ID", keep="last").set_index("PLAYER_ID")
-    d = d[d["MIN"] >= POOL_MIN].copy()
-    for name, w in wins.items():
-        d[f"{name}_W"] = w["WINS"].reindex(d.index)
-    d = d.dropna(subset=["LEBRON_W", "BPM_W"])
-    d["VALUE"] = (d["LEBRON_W"] + d["BPM_W"]) / 2
+    d = _wins_added(df_master, rating_model, bpm_model, season)
     d["CONF"] = np.where(d["TEAM_ABBREVIATION"].isin(EAST), "East", "West")
     by = {"LEBRON_RANK": "LEBRON_W", "BPM_RANK": "BPM_W", "WS_RANK": "BBR_WS"}
     for rank, col in by.items():
@@ -817,6 +823,84 @@ def deserving_allstars(df_master, rating_model, bpm_model=None, season="2026-27"
     for c in by:
         out[c] = out[c].astype("Int64")
     out.attrs.update(season=season)
+    return out
+
+
+def deserving_allnba(df_master, rating_model, bpm_model=None, season="2026-27", spots=15, next_up=10, voters=None):
+    """Who has earned an All-NBA spot: the 15 who have added the most wins so far and can still reach 65 games.
+
+    Built like deserving_allstars (same VALUE, AGREE and caveats), league-wide. DESERVES is the team, five at a time.
+    REACH_65 is the chance he gets there (shown, not used in the ranking); players who no longer can are left out, from 2023-24 on.
+    VOTE is the team predict_allnba (who will be picked) projects, if voters is given.
+    """
+    d = _wins_added(df_master, rating_model, bpm_model, season)
+    games = SEASON_GAMES if season != _regular_season(df_master)["SEASON"].max() else d.groupby("TEAM_ABBREVIATION")["GP"].transform("max")
+    d["TEAM_GAMES"] = games
+    d["SEASON"], d["OUT"] = season, 0.0
+    if not isinstance(games, int):
+        d["OUT"] = d["PLAYER_NAME"].map(KNOWN_ABSENCES).fillna(0).astype(float)
+    d = d[_can_reach(d)].copy()
+    by = {"LEBRON_RANK": "LEBRON_W", "BPM_RANK": "BPM_W", "WS_RANK": "BBR_WS"}
+    for rank, col in by.items():
+        d[rank] = d[col].rank(ascending=False, method="min").astype("Int64")
+    d["AGREE"] = (d[list(by)] <= spots).fillna(False).sum(axis=1)
+    d["RANK"] = d["VALUE"].rank(ascending=False, method="first").astype(int)
+    d["FROM_15"] = d["VALUE"] - d.loc[d["RANK"] == spots, "VALUE"].iloc[0]
+    names = np.array([TEAM_NAMES[k] for k in (3, 2, 1)] + [""])
+    out = pd.DataFrame({"RANK": d["RANK"], "DESERVES": names[np.minimum((d["RANK"] - 1) // 5, 3)], "Player": d["PLAYER_NAME"],
+                        "TEAM": d["TEAM_ABBREVIATION"], "GP": d["GP"].astype(int), "MIN": d["MIN"], **_box(d), "TS_PCT": d["TS_PCT"],
+                        "VALUE": d["VALUE"].round(2), "FROM_15": d["FROM_15"].round(2), **{c: d[c] for c in by}, "AGREE": d["AGREE"]})
+    if voters is not None:
+        p = predict_allnba(voters, df_master, rating_model, season, top=None).set_index("Player")
+        out["REACH_65"] = out["Player"].map(p["REACH_65"])
+        out["VOTE"] = out["Player"].map(p["PROJECTED"]).fillna("")
+    out = out[out["RANK"] <= spots + next_up].sort_values("RANK").reset_index(drop=True)
+    out.attrs.update(season=season)
+    return out
+
+
+def picked_vs_deserving(award, voters, df_master, rating_model, bpm_model=None, season="2026-27"):
+    """Who will be picked next to who deserves it, for "All-Star" or "All-NBA": everyone in either group.
+
+    GROUP      "both", "picked only" (voters like him more than his value does) or "deserves only" (the snubs)
+    PICK_RANK, DESERVE_RANK   his place in each list (by conference for All-Star; blank = outside the rotation pool or out of reach)
+    GAP        DESERVE_RANK - PICK_RANK: positive means voters rate him higher than his value does
+    AVAILABLE (All-Star) or REACH_65 (All-NBA)   near 0 means injury is why he isn't picked, not the voters' taste
+    CHANCE, VALUE, AGREE      as in predict_allstars / predict_allnba and deserving_allstars / deserving_allnba
+
+    Side by side, not blended: one answers what voters will do and the other what he has been worth, so an average would
+    answer neither.
+    """
+    if award == "All-Star":
+        p = predict_allstars(voters, df_master, rating_model, season, next_up=1000)
+        d = deserving_allstars(df_master, rating_model, bpm_model, season, next_up=1000)
+        spots = 12
+    elif award == "All-NBA":
+        p = predict_allnba(voters, df_master, rating_model, season, top=None)
+        p = p[p["CAN_REACH_65"]].assign(RANK=lambda t: np.arange(1, len(t) + 1))
+        d = deserving_allnba(df_master, rating_model, bpm_model, season, next_up=1000)
+        spots = 15
+    else:
+        raise ValueError('award must be "All-Star" or "All-NBA"')
+    key = ["Player", "TEAM"]
+    ready = "AVAILABLE" if award == "All-Star" else "REACH_65"
+    t = p[key + ["RANK", "CHANCE", ready]].rename(columns={"RANK": "PICK_RANK"}).merge(
+        d[key + ["RANK", "VALUE", "AGREE"]].rename(columns={"RANK": "DESERVE_RANK"}), on=key, how="outer")
+    picked, earned = t["PICK_RANK"] <= spots, t["DESERVE_RANK"] <= spots
+    t["GROUP"] = np.select([picked & earned, picked, earned], ["both", "picked only", "deserves only"], default="")
+    t = t[t["GROUP"] != ""].copy()
+    t["GAP"] = t["DESERVE_RANK"] - t["PICK_RANK"]
+    for c in ("PICK_RANK", "DESERVE_RANK", "GAP", "AGREE"):
+        t[c] = t[c].astype("Int64")
+    order = ["GROUP"]
+    if award == "All-Star":
+        t.insert(0, "CONF", np.where(t["TEAM"].isin(EAST), "East", "West"))
+        order = ["CONF", "GROUP"]
+    t["GROUP"] = pd.Categorical(t["GROUP"], ["both", "picked only", "deserves only"], ordered=True)
+    t = t.sort_values(order + ["PICK_RANK"]).reset_index(drop=True)
+    cols = order + key + ["PICK_RANK", "DESERVE_RANK", "GAP", "CHANCE", ready, "VALUE", "AGREE"]
+    out = t[cols].assign(GROUP=t["GROUP"].astype(str))
+    out.attrs.update(season=season, award=award)
     return out
 
 

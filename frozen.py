@@ -10,6 +10,7 @@
 The live models carry on as before; a copy only reads them. Each one is a folder, data/frozen/<date>/ (kept in git, so the
 commit and push dates back up when it was made):
   awards.csv          that day's rows of the award history (measured its way: no injury absences, no Basketball-Reference stats)
+  allstars.csv        predict_allstars, everyone, with that day's absences and the teammate tax (awards.csv has neither). From Nov 30
   win_totals.csv      project_season with that day's absences
   trade_values.csv    trade_value, plus MARKET_VALUE_M
   player_seasons.csv  the year-by-year projection behind trade_value. WINS is a full-season rate; REST_WINS is the part still
@@ -25,7 +26,7 @@ import numpy as np
 import pandas as pd
 
 import trade_value as T
-from awards import AWARD_HISTORY, KNOWN_ABSENCES, save_award_snapshot
+from awards import AWARD_HISTORY, KNOWN_ABSENCES, fit_allstar_model, predict_allstars, save_award_snapshot
 from nba_viz_utils import DATA_DIR
 from player_ranking import _regular_season, rank_players
 from salary_market import contracts_vs_market, score_market
@@ -75,6 +76,14 @@ def freeze_predictions(df_master, model, proj, every=7, absences=None, root=FROZ
         save_award_snapshot(df_master, model)
         history = pd.read_parquet(AWARD_HISTORY)
     awards = history[history["DATE"] == today].drop(columns="DATE").reset_index(drop=True)
+    saved = dict(KNOWN_ABSENCES)
+    KNOWN_ABSENCES.clear()
+    KNOWN_ABSENCES.update(absences)                     # the same absences as everything else in this copy
+    try:
+        stars = predict_allstars(fit_allstar_model(df_master, model, verbose=False), df_master, model, SEASON, next_up=1000, proj=proj)
+    finally:
+        KNOWN_ABSENCES.clear()
+        KNOWN_ABSENCES.update(saved)
     wins = project_season(proj, df_master, absences=absences)
     contracts = T.fetch_contract_years()
     curve, price = T.fit_aging_curve(model, df_master), T.price_of_a_win(model, df_master)
@@ -100,7 +109,7 @@ def freeze_predictions(df_master, model, proj, every=7, absences=None, root=FROZ
     out = root / str(today.date())
     tmp = root / f".{today.date()}.partial"
     tmp.mkdir(parents=True, exist_ok=True)
-    for name, t in {"awards": awards, "win_totals": wins, "trade_values": tv, "player_seasons": y}.items():
+    for name, t in {"awards": awards, "allstars": stars, "win_totals": wins, "trade_values": tv, "player_seasons": y}.items():
         t.round(6).to_csv(tmp / f"{name}.csv", index=False)
     (tmp / "meta.json").write_text(json.dumps(meta, indent=1, ensure_ascii=False))
     tmp.rename(out)                                     # all or nothing, and fails if the date exists
@@ -110,8 +119,10 @@ def freeze_predictions(df_master, model, proj, every=7, absences=None, root=FROZ
 
 
 def load_frozen(name, date=None, root=FROZEN_DIR):
-    """One table ("awards", "win_totals", "trade_values", "player_seasons") from every copy, or one date's."""
-    dates = [date] if date else frozen_dates(root)
+    """One table ("awards", "allstars", "win_totals", "trade_values", "player_seasons") from every copy that has it, or one date's."""
+    dates = [date] if date else [d for d in frozen_dates(root) if (root / d / f"{name}.csv").exists()]
+    if not dates:
+        raise ValueError(f"no copy has {name} yet")
     return pd.concat([pd.read_csv(root / d / f"{name}.csv").assign(FROZEN=d) for d in dates], ignore_index=True)
 
 
