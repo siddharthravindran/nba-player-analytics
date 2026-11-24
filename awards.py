@@ -1539,6 +1539,25 @@ def _fit_group_model(award, df_master, rating_model, penalty=None, verbose=True,
     return model
 
 
+# The fewest games, as a share of the season, for the pool (_award_pool): someone who can't get there is out of the race.
+_POOL_GAMES = {"roy": 0.3, "smoy": 0.244}
+
+
+def _absence_shift(d, cur, award):
+    """Games still to miss (KNOWN_ABSENCES) for each of this season's candidates, the same in spreads of a full season's
+    games played (the unit the GAMES weight was fitted in), and whether he can still play enough to be in the pool.
+
+    Only the games still to come: the ones already missed are in GAMES. Games played are not otherwise projected:
+    on ten past seasons frozen at 16, 30 and 45 games that did slightly worse than GAMES as it stands, for both awards.
+    """
+    left = max(SEASON_GAMES - float(cur["GAMES"].max()), 0.0)
+    out = cur["PLAYER_NAME"].map(KNOWN_ABSENCES).fillna(0.0).astype(float).clip(0, left)
+    past = d[d["SEASON"] < max(SEASONS)].groupby("SEASON")["GAMES"]
+    spread = (past.std() / past.max()).mean()
+    can = (cur["GAMES"] + left - out) >= _POOL_GAMES[award] * SEASON_GAMES
+    return out.to_numpy(), (out / SEASON_GAMES / spread).to_numpy(), can.to_numpy()
+
+
 def _predict_group(voters, df_master, rating_model, season, top, title):
     d = _award_pool(df_master, rating_model, voters.award)
     cur = d[d["SEASON"] == season].copy()
@@ -1550,7 +1569,12 @@ def _predict_group(voters, df_master, rating_model, season, top, title):
     rows = np.flatnonzero((d["SEASON"] == season).to_numpy())
     score = Z[rows] @ voters.weights.reindex(_VOTE_STATS[voters.award]).to_numpy()
     games = cur["GAMES"].max()                   # league max; the season in progress only (a finished one is left as it is)
-    early = _early(voters.award, games) if season == max(SEASONS) and cur["SHARE"].max() == 0 else 1.0
+    in_progress = season == max(SEASONS) and cur["SHARE"].max() == 0
+    early = _early(voters.award, games) if in_progress else 1.0
+    missing = np.zeros(len(cur))
+    if in_progress and KNOWN_ABSENCES:
+        missing, shift, can = _absence_shift(d, cur, voters.award)
+        score = np.where(can, score - voters.weights["GAMES"] * shift, -np.inf)
     chance = _softmax(early * voters.temperature * score)
     out = pd.DataFrame({"Player": cur["PLAYER_NAME"].to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
                         "GP": cur["GAMES"].astype(int).to_numpy(), "MIN": cur["MINUTES_PG"].round(1).to_numpy(),
@@ -1559,6 +1583,8 @@ def _predict_group(voters, df_master, rating_model, season, top, title):
                         "BLK": cur["BLK"].round(1).to_numpy(), "TS_PCT": cur["TS_PCT"].round(3).to_numpy(),
                         "RATING": cur["RATING"].round(2).to_numpy(), "TEAM_W_PCT": cur["W_PCT"].round(3).to_numpy(),
                         "WIN_PCT": (chance * 100).round(1), "_WIN": chance})
+    if in_progress:                               # games still to miss
+        out.insert(out.columns.get_loc("GP") + 1, "OUT", missing.astype(int))
     if voters.award == "smoy":                    # how much of his season came off the bench
         out.insert(out.columns.get_loc("GP") + 1, "STARTS", cur["STARTS"].fillna(0).astype(int).to_numpy())
         try:
@@ -1582,7 +1608,7 @@ def fit_roy_model(df_master, rating_model, penalty=None, verbose=True):
 
 
 def predict_roy(voters, df_master, rating_model, season="2026-27", top=10):
-    """Each rookie's percentage chance of winning Rookie of the Year, for a season (WIN_PCT adds up to 100 over the pool)."""
+    """Each rookie's percentage chance of winning Rookie of the Year, for a season (WIN_PCT adds up to 100 over the pool). KNOWN_ABSENCES count as games missed (OUT)."""
     return _predict_group(voters, df_master, rating_model, season, top, "Rookie of the Year")
 
 
@@ -1592,5 +1618,5 @@ def fit_smoy_model(df_master, rating_model, penalty=None, verbose=True):
 
 
 def predict_smoy(voters, df_master, rating_model, season="2026-27", top=10):
-    """Each bench player's percentage chance of winning Sixth Man of the Year, for a season (WIN_PCT adds up to 100)."""
+    """Each bench player's percentage chance of winning Sixth Man of the Year, for a season (WIN_PCT adds up to 100). KNOWN_ABSENCES count as games missed (OUT)."""
     return _predict_group(voters, df_master, rating_model, season, top, "Sixth Man of the Year")
