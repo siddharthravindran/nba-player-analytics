@@ -46,7 +46,7 @@ from scipy.stats import norm
 
 from nba_viz_utils import cached_fetch
 
-__all__ = ["fit_projection", "load_or_fit_projection", "project_season", "load_games", "player_ratings"]
+__all__ = ["fit_projection", "load_or_fit_projection", "project_season", "vote_standings", "load_games", "player_ratings"]
 
 SEASONS = [f"{y}-{str(y + 1)[2:]}" for y in range(2015, 2027)]
 CURRENT = SEASONS[-1]
@@ -485,6 +485,29 @@ def _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw,
     return (ha, aa, end), avg
 
 
+def _outlook(proj, df_master, season, absences, moves=None):
+    """Games played, games left, teams, ratings, home court, games behind each rating, and lineup adjustments per game left."""
+    played = load_games(season)
+    teams = sorted(proj.final[SEASONS[-2]].index)
+    prior = proj.final[SEASONS[-2]].reindex(teams).fillna(0).to_numpy() * proj.carry
+    use_players = proj.roster_weight > 0 and df_master is not None
+    if use_players:
+        from player_ranking import _regular_season
+        cur = _regular_season(df_master)
+        cur = cur[cur["SEASON"] == season]
+        minutes = pd.DataFrame({"PLAYER_ID": cur["PLAYER_ID"].astype(int).to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
+                                "GP": cur["GP"].to_numpy(), "MINUTES": (cur["MIN"] * cur["GP"]).astype(float).to_numpy()})
+        now_raw = _roster_raw(minutes, season, proj.ratings, teams, current=True)
+        prior = prior + proj.roster_weight * _centered(now_raw).to_numpy()
+    r, h, n = _ratings(played, teams, prior, proj.prior_games)
+    _, gp = _record(played, teams)
+    rest = _remaining_schedule(season)
+    adj, lineup = (None, pd.Series(0.0, index=teams))
+    if use_players:
+        adj, lineup = _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, gp, moves)
+    return played, rest, teams, r, h, n, adj, lineup
+
+
 def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=None, return_sims=False, moves=None):
     """This season: wins so far, expected final wins, an 80% range, and the chance of the top 6 / top 10 in the conference.
 
@@ -499,24 +522,8 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     moves: {player name: new team} to try a trade: he plays for the new team in
     every remaining game (the games already played stay where they were).
     """
-    played = load_games(season)
-    teams = sorted(proj.final[SEASONS[-2]].index)
-    prior = proj.final[SEASONS[-2]].reindex(teams).fillna(0).to_numpy() * proj.carry
-    use_players = proj.roster_weight > 0 and df_master is not None
-    if use_players:
-        from player_ranking import _regular_season
-        cur = _regular_season(df_master)
-        cur = cur[cur["SEASON"] == season]
-        minutes = pd.DataFrame({"PLAYER_ID": cur["PLAYER_ID"].astype(int).to_numpy(), "TEAM": cur["TEAM_ABBREVIATION"].to_numpy(),
-                                "GP": cur["GP"].to_numpy(), "MINUTES": (cur["MIN"] * cur["GP"]).astype(float).to_numpy()})
-        now_raw = _roster_raw(minutes, season, proj.ratings, teams, current=True)
-        prior = prior + proj.roster_weight * _centered(now_raw).to_numpy()
-    r, h, n = _ratings(played, teams, prior, proj.prior_games)
+    played, rest, teams, r, h, n, adj, lineup = _outlook(proj, df_master, season, absences, moves)
     wins_now, gp = _record(played, teams)
-    rest = _remaining_schedule(season)
-    adj, lineup = (None, pd.Series(0.0, index=teams))
-    if use_players:
-        adj, lineup = _lineup_adjustments(rest, teams, df_master, proj, season, absences, now_raw, gp, moves)
     sd = pd.Series(proj.sd_scale * proj.sigma / np.sqrt(n + proj.prior_games), index=teams)
     scheduled = gp + rest["HOME"].value_counts().add(rest["AWAY"].value_counts(), fill_value=0).reindex(teams).fillna(0)
     unscheduled = (SEASON_GAMES - scheduled).clip(lower=0)
@@ -556,6 +563,50 @@ def project_season(proj, df_master=None, season=CURRENT, sims=SIMS, absences=Non
     if return_sims:                     # every simulated season, for draft-pick odds: final wins and who made the playoffs
         return out, {"teams": list(teams), "wins": sim, "playoffs": playoffs}
     return out
+
+
+ALLSTAR_VOTE_GAMES = {"2020-21": 30}           # games per team when coaches picked reserves; 47 (late January) otherwise
+
+
+def vote_standings(season=CURRENT, proj=None, df_master=None, absences=None, sims=4000):
+    """Conference rank at the All-Star vote: every simulated season's ranks (sims x teams) and the teams.
+
+    The standings that count are the ones on the day the coaches vote, when the
+    median team has played about 47 games. After that day they are the real
+    ones (one row). Before it, today's record plus the games up to then, simulated
+    like project_season; games not on the schedule yet are left out. Ranked by
+    win percentage; ties are shared (the better rank) once real, split at random before.
+    """
+    at = ALLSTAR_VOTE_GAMES.get(season, 47)
+    played = load_games(season)
+    gp = pd.concat([played["HOME"], played["AWAY"]]).value_counts()
+    conf_of = lambda teams: np.array(["East" if t in EAST else "West" for t in teams])
+    if season != CURRENT or (len(gp) == 30 and gp.median() > at):
+        then, _, _ = _cut(played, at)
+        teams = sorted(set(played["HOME"]) | set(played["AWAY"]))
+        w, n = _record(then, teams)
+        return (w / n).groupby(conf_of(teams)).rank(ascending=False, method="min").to_numpy()[None, :], teams
+    if proj is None:
+        raise ValueError("before the vote, vote_standings needs a projection (load_or_fit_projection)")
+    played, rest, teams, r, h, n, adj, _ = _outlook(proj, df_master, season, absences)
+    wins_now, gp = _record(played, teams)
+    long = pd.concat([rest[["DATE", "HOME"]].rename(columns={"HOME": "T"}), rest[["DATE", "AWAY"]].rename(columns={"AWAY": "T"})]).sort_values("DATE")
+    long["N"] = long.groupby("T").cumcount() + 1 + long["T"].map(gp)
+    day = long[long["N"] == at].groupby("T")["DATE"].first().median()
+    keep = (rest["DATE"] <= day).to_numpy()
+    if adj is not None:
+        adj = (adj[0][keep], adj[1][keep], adj[2])
+    rest = rest[keep]
+    total = gp + rest["HOME"].value_counts().add(rest["AWAY"].value_counts(), fill_value=0).reindex(teams).fillna(0)
+    sd = pd.Series(proj.sd_scale * proj.sigma / np.sqrt(n + proj.prior_games), index=teams)
+    sim = _simulate(rest, r, h, proj.sigma, sd, teams, wins_now, sims=sims, adj=adj) / total.to_numpy()[None, :]
+    sim = sim + np.random.default_rng(3).random(sim.shape) * 1e-6
+    ranks = np.empty(sim.shape)
+    conf = conf_of(teams)
+    for cf in ("East", "West"):
+        cols = np.flatnonzero(conf == cf)
+        ranks[:, cols] = (-sim[:, cols]).argsort(axis=1).argsort(axis=1) + 1
+    return ranks, teams
 
 
 def load_or_fit_projection(df_master, rating_model, max_age_days=7, refit=False):

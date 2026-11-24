@@ -91,6 +91,10 @@ INDEFINITE_GAMES = 10                        # "out" with no timeline: about thr
 # 40 games in, reserves about 50; more than about 10 games missed by then is roughly the cut-off (an estimate).
 ALLSTAR_VOTE_AT = {"starter": 40, "reserve": 50}
 ALLSTAR_MISSED_LIMIT = 10           # the awards whose stats are pulled toward last season; games are projected for all
+# Teammate tax: coaches rarely give a mediocre team two All-Stars. A player who isn't his team's best candidate is
+# marked down by how far below third in the conference the team is at the vote: 0 through 3rd, a third of a step
+# per spot from 4th, TAX_MAX_STEPS at 9th and below. The size of a step is fitted (fit_allstar_model).
+TAX_FREE_RANK, TAX_SPOTS_PER_STEP, TAX_MAX_STEPS = 3, 3, 2
 EARLY_PRIOR_MIN_GP = 20                      # a "last season" shorter than this is skipped for the one before
 _TEAM_STATS = ["W_PCT", "DEF_RATING", "ONOFF_DEF_RATING"]         # say little about him once he has changed teams
 _NOT_PROJECTED = ["PRIOR", "PRIOR_NBA", "SOPHOMORE", "BBR_AGE"]   # facts about him, not this season's play
@@ -112,6 +116,7 @@ class AllNBAModel:
     check: pd.DataFrame = field(default=None, repr=False)      # leave-one-season-out results
     missed: pd.DataFrame = field(default=None, repr=False)     # every wrong call in those runs
     award: str = "nba"                                         # "nba", "defense", "mip" or "mvp"
+    tax: tuple = None                                          # All-Star only: (intercept, weight on the score, teammate tax)
     temperature: float = 1.0                                   # MVP only: sharpens vote shares into a chance of winning
 
 
@@ -680,14 +685,31 @@ def predict_allnba(voters, df_master, rating_model, season="2026-27", top=30):
     return out.head(top) if top else out
 
 
-def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12, next_up=12):
+def _vote_standings(df_master, rating_model, season, proj=None):
+    """team_projection.vote_standings, with the saved projection fit when one is needed and none is given."""
+    import contextlib, io
+    from team_projection import CURRENT, load_or_fit_projection, vote_standings
+    with contextlib.redirect_stdout(io.StringIO()):                                       # no line per cached file
+        if season == CURRENT and proj is None:
+            proj = load_or_fit_projection(df_master, rating_model, max_age_days=400)      # any saved fit will do
+        return vote_standings(season, proj, df_master, dict(KNOWN_ABSENCES))
+
+
+def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12, next_up=12, proj=None, tax=True):
     """All-Stars by conference: the `spots` players voters would rate highest, then the next few in line.
 
     SPOT     "starter" for a conference's top five, "reserve" for the rest of the 12, "next" for the next 12 in line (24 per conference)
     SCORE    the voting model's score (higher is better); it keeps separating players after CHANCE has hit zero
     AVAILABLE  chance he has missed no more than ALLSTAR_MISSED_LIMIT games by the vote
     CHANCE   his chance of being picked, from the All-Star voting model
+    VOTE_SEED    his team's average conference rank at the vote (about 47 games in): simulated until then, real after
+    TAX          what his score loses for a better-rated teammate on a team below third (0 for most)
     RATING_RANK  where the impact model has him in his conference, for contrast
+
+    The tax uses the expected standings on the day coaches vote, not today's:
+    averaged over simulated seasons, so it moves smoothly. proj: from
+    load_or_fit_projection (the saved fit if not given). tax=False leaves it
+    out; the award history does, because earlier days were saved without it.
 
     Uses the All-Star voting model (fit_allstar_model), trained on real
     All-Star selections; pass any voters, it fits that model once if needed.
@@ -706,13 +728,22 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
         voters = _allstar_cache[key]
     pool, pull, chance = _voter_scores(voters, df_master, rating_model, season, games_rule=False)
     score = pull.sum(axis=1) + voters.intercept
+    seed, cost = pd.Series(np.nan, index=pool.index), pd.Series(0.0, index=pool.index)
+    if tax and voters.tax is not None:
+        ranks, teams = _vote_standings(df_master, rating_model, season, proj)
+        seed = pool["TEAM_ABBREVIATION"].map(dict(zip(teams, ranks.mean(axis=0))))
+        step = pool["TEAM_ABBREVIATION"].map(dict(zip(teams, _tax_steps(ranks).mean(axis=0)))).fillna(0)
+        base, weight, per_step = voters.tax
+        cost = per_step * step * _not_first(pool, score)
+        score = base + weight * score + cost
+        chance = 1 / (1 + np.exp(-score))
     with np.errstate(divide="ignore"):                       # odds times the chance he's available; 0 sinks him
         as_starter = score + np.log(pool["ALLSTAR_OK_STARTER"])
         as_reserve = score + np.log(pool["ALLSTAR_OK_RESERVE"])
     out = pd.DataFrame({
         "CONF": np.where(pool["TEAM_ABBREVIATION"].isin(EAST), "East", "West"),
         "Player": pool["PLAYER_NAME"], "TEAM": pool["TEAM_ABBREVIATION"], "GP": pool["GP"].astype(int),
-        **_box(pool), "W_PCT": pool["W_PCT"], "SCORE": score, "CHANCE": chance,
+        **_box(pool), "W_PCT": pool["W_PCT"], "SCORE": score, "CHANCE": chance, "VOTE_SEED": seed.round(1), "TAX": cost.round(2) + 0.0,
         "RATING": pool["RATING"], "WHY": [_reasons(r, 1) for _, r in pull.iterrows()],
         "_STARTER": as_starter, "_RESERVE": as_reserve,
         "OK_STARTER": pool["ALLSTAR_OK_STARTER"], "OK_RESERVE": pool["ALLSTAR_OK_RESERVE"],
@@ -728,7 +759,7 @@ def predict_allstars(voters, df_master, rating_model, season="2026-27", spots=12
         parts.append(g)
     out = pd.concat(parts)
     out["SPOT"] = np.select([out["RANK"] <= 5, out["RANK"] <= spots], ["starter", "reserve"], default="next")
-    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", *_BOX, "W_PCT", "SCORE", "CHANCE", "AVAILABLE", "RATING_RANK", "WHY"]
+    cols = ["CONF", "SPOT", "RANK", "Player", "TEAM", "GP", *_BOX, "W_PCT", "SCORE", "CHANCE", "AVAILABLE", "VOTE_SEED", "TAX", "RATING_RANK", "WHY"]
     out = out[cols].reset_index(drop=True)
     out.attrs.update(season=season)
     return out
@@ -1193,6 +1224,15 @@ def use_injury_report(df_master, season="2026-27", today=None, refresh=False):
 
 
 # ---------------------------------------------------------------- All-Star
+def _tax_steps(rank):
+    return np.clip((np.asarray(rank, float) - TAX_FREE_RANK) / TAX_SPOTS_PER_STEP, 0, TAX_MAX_STEPS)
+
+
+def _not_first(pool, score):
+    """Is a teammate rated higher? (his team's best All-Star candidate pays no tax)"""
+    return score.groupby([pool["SEASON"], pool["TEAM_ABBREVIATION"]]).rank(ascending=False, method="first") > 1
+
+
 def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
     """All-Star voting model, trained on every All-Star selection since 2015-16.
 
@@ -1201,6 +1241,10 @@ def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
     and coaches reward rather than borrowing the All-NBA vote. PRIOR is past
     All-Star selections. Checked one season at a time: each conference's 12
     most likely against who was really picked.
+
+    A second stage then fits the teammate tax (see TAX_FREE_RANK) on the first
+    stage's held-out scores and the standings when coaches voted. NO_TAX in
+    .check is the same test without it.
 
     Caveat: the stats are full-season numbers, but the vote happens about 50
     games in, so the training sees a little of what came after the vote.
@@ -1225,7 +1269,23 @@ def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
             p = held_out(C)[known].clip(1e-6, 1 - 1e-6)
             loss[C] = float(-(np.where(y[known], np.log(p), np.log(1 - p))).mean())
         penalty = min(loss, key=loss.get)
-    chance = held_out(penalty)
+    plain = held_out(penalty)
+
+    # teammate tax, fitted on held-out scores and checked one season at a time
+    score = np.log(plain.clip(1e-9, 1 - 1e-9) / (1 - plain.clip(1e-9, 1 - 1e-9)))
+    steps = {}
+    for s in seasons:
+        ranks, teams = _vote_standings(df_master, rating_model, s)
+        steps.update({(s, t): x for t, x in zip(teams, _tax_steps(ranks).mean(axis=0))})
+    step = pd.Series([steps.get(k, 0.0) for k in zip(pool["SEASON"], pool["TEAM_ABBREVIATION"])], index=pool.index)
+    S = pd.DataFrame({"SCORE": score.fillna(0), "TAX": step * _not_first(pool, score)})
+    second = lambda rows: LogisticRegression(C=1000, max_iter=5000).fit(S[rows], y[rows])
+    chance = pd.Series(np.nan, index=pool.index)
+    for s in seasons:
+        test = known & (pool["SEASON"] == s).to_numpy()
+        chance[test] = second(known & ~test).predict_proba(S[test])[:, 1]
+    two = second(known)
+    tax = (float(two.intercept_[0]), float(two.coef_[0][0]), float(two.coef_[0][1]))
 
     rows = []
     for s in seasons:
@@ -1234,7 +1294,7 @@ def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
             g = pool[here]
             real = set(g.index[y[here]])
             top = lambda col: set(g[col].nlargest(12).index) if isinstance(col, str) else set(col[here].nlargest(12).index)
-            rows.append({"SEASON": s, "CONF": c, "PICKED": len(real), "RIGHT_OF_12": len(top(chance) & real),
+            rows.append({"SEASON": s, "CONF": c, "PICKED": len(real), "RIGHT_OF_12": len(top(chance) & real), "NO_TAX": len(top(plain) & real),
                          "TOP_SCORERS": len(top("PTS") & real), "TOP_RATING": len(top("RATING") & real)})
     check = pd.DataFrame(rows)
     fit = LogisticRegression(C=penalty, max_iter=5000).fit(Z[known], y[known])
@@ -1248,8 +1308,10 @@ def fit_allstar_model(df_master, rating_model, penalty=None, verbose=True):
         print(f"  for comparison, each conference's 12 top scorers get {check['TOP_SCORERS'].sum()}, "
               f"its 12 best impact ratings {check['TOP_RATING'].sum()}")
         lab = lambda k: "past All-Star selections" if k == "PRIOR" else LABELS[k]
+        print(f"  without the teammate tax, {check['NO_TAX'].sum()}; the tax is {tax[2]:+.2f} per step "
+              f"(three conference spots below 3rd) for anyone who isn't his team's best candidate")
         print("What voters reward most: " + ", ".join(f"{lab(k)} ({v:+.2f})" for k, v in weights.head(6).items()))
-    return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, None, "star")
+    return AllNBAModel(weights, float(fit.intercept_[0]), penalty, seasons, check, None, "star", tax)
 
 
 _allstar_cache = {}
@@ -1304,7 +1366,7 @@ def award_snapshot(df_master, rating_model, season="2026-27", penalties=None):
         parts = {
             "MVP": predict_mvp(mvp, dm, rating_model, season, top=None).rename(columns={"WIN_CHANCE": "CHANCE"}),
             "All-NBA": predict_allnba(nba, dm, rating_model, season, top=None),
-            "All-Star": predict_allstars(star, dm, rating_model, season, next_up=40),
+            "All-Star": predict_allstars(star, dm, rating_model, season, next_up=40, tax=False),
             "All-Defensive": pick_all_defense(rating_model, dm, season, top=None, voters=dfn),
             "Most Improved": predict_mip(mip, dm, rating_model, season, top=None),
         }
